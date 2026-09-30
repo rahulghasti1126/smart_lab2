@@ -1,0 +1,4 @@
+User-agent: *
+Allow: /
+
+Sitemap: https://smartlab2-frontend.vercel.app/sitemap.xml

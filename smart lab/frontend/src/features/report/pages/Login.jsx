@@ -133,9 +133,10 @@ const Login = () => {
           </Link>
         </p>
 
-        {/* Demo credentials */}
+        {/* Public product description */}
         <div className="mt-6 text-xs text-gray-500 bg-gray-100 p-3 rounded-lg text-center">
-          Demo Login → Username: <b>rahul</b> | Password: <b>1234</b>
+          <p className="font-semibold text-gray-700">Pathology Laboratory Management System</p>
+          <p className="mt-1">Smart Lab brings patient registration, pathology testing, analyzer results, reports, billing, inventory and laboratory workflows together.</p>
         </div>
       </div>
     </div>

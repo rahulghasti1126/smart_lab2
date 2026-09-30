@@ -1,5 +1,5 @@
-import React from 'react';
-import { BrowserRouter, Routes, Route, Navigate } from 'react-router-dom';
+import React, { useEffect } from 'react';
+import { BrowserRouter, Routes, Route, Navigate, useLocation } from 'react-router-dom';
 import Login from '../features/report/pages/Login';
 import Register from '../features/report/pages/Register';
 import Home from '../features/report/pages/Home';
@@ -23,9 +23,23 @@ const PrivateRoute = ({ children }) => {
   return user ? children : <Navigate to="/" />;
 };
 
+const RouteIndexing = () => {
+  const { pathname } = useLocation();
+
+  useEffect(() => {
+    const robots = document.querySelector('meta[name="robots"]');
+    if (robots) {
+      robots.content = pathname === '/' ? 'index, follow' : 'noindex, nofollow';
+    }
+  }, [pathname]);
+
+  return null;
+};
+
 function App() {
   return (
     <BrowserRouter>
+      <RouteIndexing />
       <Routes>
         <Route path="/" element={<Login />} />
         <Route path="/register" element={<Register />} />
