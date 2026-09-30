@@ -17,10 +17,16 @@ const Login = () => {
 
     try {
       const user = await loginUser({ username, password });
+
       localStorage.removeItem("user");
       localStorage.setItem("user", JSON.stringify(user));
-      localStorage.setItem("activeUser", user.username || user.name || username);
-      window.location.href = "/home";
+      localStorage.setItem(
+        "activeUser",
+        user.username || user.name || username
+      );
+
+      // React Router navigation - prevents Vercel 404
+      navigate("/home");
     } catch (err) {
       setError(err.message || "Invalid username or password");
     } finally {
@@ -34,7 +40,7 @@ const Login = () => {
       style={{ backgroundImage: "url('/background.png')" }}
     >
       {/* Dark overlay */}
-      <div className="absolute inset-0 "></div>
+      <div className="absolute inset-0"></div>
 
       {/* Login Card */}
       <div className="relative bg-white/90 backdrop-blur-lg rounded-3xl shadow-2xl w-full max-w-md p-8 border border-white/40">
@@ -43,7 +49,11 @@ const Login = () => {
           <div className="bg-blue-100 w-20 h-20 rounded-full flex items-center justify-center mx-auto mb-4 shadow">
             <span className="text-3xl">🔬</span>
           </div>
-          <h1 className="text-3xl font-bold text-gray-800">Smart Lab</h1>
+
+          <h1 className="text-3xl font-bold text-gray-800">
+            Smart Lab
+          </h1>
+
           <p className="text-gray-600 mt-1 text-sm">
             Pathology Laboratory Management System
           </p>
@@ -58,10 +68,12 @@ const Login = () => {
 
         {/* Form */}
         <form onSubmit={handleSubmit} className="space-y-5">
+          {/* Username */}
           <div>
             <label className="text-sm font-semibold text-gray-700">
               Username / License ID
             </label>
+
             <input
               type="text"
               placeholder="Enter username"
@@ -72,10 +84,12 @@ const Login = () => {
             />
           </div>
 
+          {/* Password */}
           <div>
             <label className="text-sm font-semibold text-gray-700">
               Password
             </label>
+
             <input
               type="password"
               placeholder="Enter password"
@@ -86,16 +100,19 @@ const Login = () => {
             />
           </div>
 
+          {/* Remember Me */}
           <div className="flex items-center justify-between text-sm">
             <label className="flex items-center gap-2">
               <input type="checkbox" />
               Remember me
             </label>
+
             <span className="text-blue-600 cursor-pointer hover:underline">
               Forgot Password?
             </span>
           </div>
 
+          {/* Login Button */}
           <button
             type="submit"
             disabled={loading}
@@ -107,8 +124,11 @@ const Login = () => {
 
         {/* Register */}
         <p className="text-center text-sm text-gray-600 mt-6">
-          New Pathologist?{' '}
-          <Link to="/register" className="text-blue-600 font-semibold hover:underline">
+          New Pathologist?{" "}
+          <Link
+            to="/register"
+            className="text-blue-600 font-semibold hover:underline"
+          >
             Register here
           </Link>
         </p>
