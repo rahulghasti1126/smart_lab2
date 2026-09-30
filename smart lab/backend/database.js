@@ -9,15 +9,14 @@ const __dirname = dirname(__filename);
 
 dotenv.config({ path: resolve(__dirname, '.env') });
 
-const hashPassword = (password) =>
-  crypto.scryptSync(password, 'smartlab_salt', 64).toString('hex');
-
-const MONGO_URI = process.env.MONGO_URI?.replace(/^['"]|['"]$/g, '').trim();
+const MONGO_URI = process.env.MONGO_URI?.trim();
 
 if (!MONGO_URI) {
-  console.error('MONGO_URI is required in backend/.env');
+  console.error('MONGO_URI environment variable is missing.');
   process.exit(1);
 }
+
+console.log('MongoDB URI detected:', MONGO_URI.replace(/\/\/([^:]+):([^@]+)@/, '//***:***@'));
 
 const connectDB = async () => {
   try {
