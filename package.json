@@ -1,0 +1,17 @@
+{
+  "name": "smart-lab-workspace",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "install:all": "npm install --prefix \"smart lab/backend\" && npm install --prefix \"smart lab/frontend\"",
+    "dev:backend": "npm run dev --prefix \"smart lab/backend\"",
+    "dev:frontend": "npm run dev --prefix \"smart lab/frontend\"",
+    "build:frontend": "npm run build --prefix \"smart lab/frontend\"",
+    "build": "npm run build:frontend",
+    "start": "npm run start --prefix \"smart lab/backend\"",
+    "dev": "concurrently \"npm run dev:backend\" \"npm run dev:frontend\""
+  },
+  "devDependencies": {
+    "concurrently": "^8.2.2"
+  }
+}

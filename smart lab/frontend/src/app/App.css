@@ -1,0 +1,83 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* ---------- Global Font ---------- */
+body {
+  @apply bg-gray-100 text-gray-800;
+  font-family: 'Inter', sans-serif;
+}
+
+/* ---------- Smooth Scroll ---------- */
+html {
+  scroll-behavior: smooth;
+}
+
+/* ---------- Custom Scrollbar ---------- */
+::-webkit-scrollbar {
+  width: 8px;
+}
+
+::-webkit-scrollbar-track {
+  @apply bg-gray-200;
+}
+
+::-webkit-scrollbar-thumb {
+  @apply bg-blue-500 rounded-full;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  @apply bg-blue-600;
+}
+
+/* ---------- Glass Card Effect (Login etc.) ---------- */
+.glass-card {
+  background: rgba(255, 255, 255, 0.85);
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+  border-radius: 1.5rem;
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.15);
+}
+
+/* ---------- Lab Gradient Background ---------- */
+.lab-bg {
+  background: linear-gradient(135deg, #0f172a, #0ea5e9, #14b8a6);
+  background-size: cover;
+  background-position: center;
+}
+
+/* ---------- Button Style ---------- */
+.btn-primary {
+  @apply bg-gradient-to-r from-blue-600 to-teal-500 text-white font-semibold py-3 px-6 rounded-lg shadow-md transition duration-300;
+}
+
+.btn-primary:hover {
+  @apply from-blue-700 to-teal-600 scale-105;
+}
+
+/* ---------- Card Shadow Hover ---------- */
+.card-hover {
+  @apply transition duration-300 hover:shadow-xl hover:-translate-y-1;
+}
+
+/* ---------- Table Styling ---------- */
+.table-head {
+  @apply bg-gray-100 text-gray-700 uppercase text-sm;
+}
+
+.table-row {
+  @apply border-b hover:bg-gray-50 transition;
+}
+
+/* ---------- Status Badges ---------- */
+.badge-success {
+  @apply bg-green-100 text-green-700 px-2 py-1 rounded-full text-xs font-semibold;
+}
+
+.badge-warning {
+  @apply bg-yellow-100 text-yellow-700 px-2 py-1 rounded-full text-xs font-semibold;
+}
+
+.badge-info {
+  @apply bg-blue-100 text-blue-700 px-2 py-1 rounded-full text-xs font-semibold;
+}
