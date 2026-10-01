@@ -249,6 +249,10 @@ export const createAnalyzer = async (data) => handleResponse(await fetch(`${API}
   method: "POST", headers: machineHeaders(), body: JSON.stringify(data),
 }));
 
+export const updateAnalyzer = async (id, data) => handleResponse(await fetch(`${API}/machine-integration/analyzers/${id}`, {
+  method: "PATCH", headers: machineHeaders(), body: JSON.stringify(data),
+}));
+
 export const testAnalyzerConnection = async (id) => handleResponse(await fetch(`${API}/machine-integration/analyzers/${id}/test-connection`, {
   method: "POST", headers: machineHeaders(),
 }));

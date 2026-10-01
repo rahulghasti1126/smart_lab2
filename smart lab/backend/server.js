@@ -145,40 +145,157 @@ app.post('/api/machine-integration/analyzers/:id/test-connection', requireMachin
   try {
     const analyzer = await getAnalyzerOr404(req, res);
     if (!analyzer) return;
-    const tcpServer = getCippointTcpServer();
-    const listening = Boolean(tcpServer?.listening);
+
+    let isConnected = false;
+    let status = 'STOPPED';
+
+    if (analyzer.tcp_mode === 'SERVER') {
+      const server = dynamicServers[analyzer._id];
+      isConnected = Boolean(server && server.listening);
+      status = isConnected ? 'WAITING FOR ANALYZER' : 'STOPPED';
+    } else {
+      const client = dynamicClients[analyzer._id];
+      isConnected = Boolean(client && !client.destroyed);
+      status = isConnected ? 'CONNECTED' : 'STOPPED';
+    }
+
     res.json({
-      connected: false,
-      status: listening ? 'WAITING FOR ANALYZER' : 'STOPPED',
-      message: listening ? 'LIS TCP listener is running; waiting for Cippoint.' : 'LIS TCP listener is not running.',
-      host: '0.0.0.0',
-      port: 8001,
+      connected: isConnected,
+      status,
+      message: isConnected ? 'Connection is active.' : 'Connection is inactive.',
+      host: analyzer.tcp_mode === 'SERVER' ? analyzer.server_ip : analyzer.ip_address,
+      port: analyzer.port,
     });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
+const dynamicServers = {};
+const dynamicClients = {};
+
 app.post('/api/machine-integration/analyzers/:id/connect', requireMachineAdmin, async (req, res) => {
   try {
     const analyzer = await getAnalyzerOr404(req, res);
     if (!analyzer) return;
-    if (analyzer.tcp_mode !== 'SERVER') {
-      return res.status(400).json({ error: 'Cippoint must use TCP Server mode for this test.' });
+
+    if (analyzer.tcp_mode === 'SERVER') {
+      if (dynamicServers[analyzer._id]) {
+        return res.json({ status: 'WAITING FOR ANALYZER', message: 'Already listening', analyzerId: analyzer._id });
+      }
+
+      const server = net.createServer((socket) => {
+        const remoteIp = socket.remoteAddress;
+        console.log(`Analyzer connected from ${remoteIp}`);
+
+        socket.on('data', async (chunk) => {
+          const rawData = chunk.toString('utf8');
+          console.log(`Raw data from ${analyzer.name}:`, rawData);
+          emitUpdate('raw-analyzer-data', { raw: rawData });
+
+          handleAnalyzerData(rawData);
+
+          try {
+            await machineIntegration.receiveRawMessage({ analyzer, rawMessage: rawData, sourceIp: remoteIp, connectionAt: new Date().toISOString(), captureOnly: true });
+          } catch (error) {
+            console.error(`Message storage error: ${error.message}`);
+          }
+        });
+
+        socket.on('error', (err) => console.error(`Socket error: ${err.message}`));
+        socket.on('close', () => console.log(`Analyzer disconnected`));
+      });
+
+      server.on('error', (err) => {
+        console.error(`Server error: ${err.message}`);
+        AnalyzerConfig.findByIdAndUpdate(analyzer._id, { connection_status: 'ERROR', updated_at: new Date().toISOString() }).exec();
+      });
+
+      server.listen(analyzer.port, '0.0.0.0', async () => {
+        console.log(`Listening on 0.0.0.0:${analyzer.port} for ${analyzer.name}`);
+        dynamicServers[analyzer._id] = server;
+        await AnalyzerConfig.findByIdAndUpdate(analyzer._id, { connection_status: 'WAITING FOR ANALYZER', updated_at: new Date().toISOString() });
+      });
+
+      res.json({ status: 'STARTING', message: `Listening on 0.0.0.0:${analyzer.port}`, analyzerId: analyzer._id });
+    } else {
+      if (dynamicClients[analyzer._id]) {
+        return res.json({ status: 'CONNECTED', message: 'Already connected', analyzerId: analyzer._id });
+      }
+
+      const client = new net.Socket();
+      client.connect(analyzer.port, analyzer.ip_address, async () => {
+        console.log(`Connected to ${analyzer.name} at ${analyzer.ip_address}:${analyzer.port}`);
+        dynamicClients[analyzer._id] = client;
+        await AnalyzerConfig.findByIdAndUpdate(analyzer._id, { connection_status: 'CONNECTED', updated_at: new Date().toISOString() });
+        emitUpdate('machine-connected', { path: `TCP://${analyzer.ip_address}:${analyzer.port}` });
+        res.json({ status: 'CONNECTED', message: `Connected to ${analyzer.ip_address}:${analyzer.port}`, analyzerId: analyzer._id });
+      });
+
+      let buffer = '';
+      client.on('data', async (chunk) => {
+        const str = chunk.toString('utf8');
+        emitUpdate('raw-analyzer-data', { raw: str });
+        buffer += str;
+        let lines = buffer.split(/\r?\n/);
+        buffer = lines.pop();
+        for (const line of lines) {
+          if (line.trim()) {
+            handleAnalyzerData(line);
+          }
+        }
+
+        try {
+          await machineIntegration.receiveRawMessage({ analyzer, rawMessage: str, sourceIp: analyzer.ip_address, connectionAt: new Date().toISOString(), captureOnly: true });
+        } catch (error) {
+          console.error(`Message storage error: ${error.message}`);
+        }
+      });
+
+      client.on('error', async (err) => {
+        console.error(`Client error for ${analyzer.name}: ${err.message}`);
+        emitUpdate('machine-error', { error: err.message });
+        await AnalyzerConfig.findByIdAndUpdate(analyzer._id, { connection_status: 'ERROR', updated_at: new Date().toISOString() });
+        delete dynamicClients[analyzer._id];
+        if (!res.headersSent) res.status(500).json({ success: false, message: 'Connection failed', status: 'ERROR', error: err.message });
+      });
+
+      client.on('close', async () => {
+        console.log(`Connection closed for ${analyzer.name}`);
+        emitUpdate('machine-disconnected', { path: `TCP://${analyzer.ip_address}:${analyzer.port}` });
+        await AnalyzerConfig.findByIdAndUpdate(analyzer._id, { connection_status: 'STOPPED', updated_at: new Date().toISOString() });
+        delete dynamicClients[analyzer._id];
+      });
     }
-    const tcpServer = getCippointTcpServer() || startCippointTcpServer({ onData: handleCippointData, onStatus: handleCippointStatus });
-    const status = tcpServer.listening ? 'WAITING FOR ANALYZER' : 'STARTING';
-    await AnalyzerConfig.findByIdAndUpdate(analyzer._id, { connection_status: status, updated_at: new Date().toISOString() });
-    res.json({ status, message: 'Listening on 0.0.0.0:8001', analyzerId: analyzer._id });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    if (!res.headersSent) res.status(500).json({ error: err.message });
   }
 });
 
 app.post('/api/machine-integration/analyzers/:id/disconnect', requireMachineAdmin, async (req, res) => {
-  await stopCippointTcpServer();
-  await AnalyzerConfig.findByIdAndUpdate(req.params.id, { connection_status: 'STOPPED', updated_at: new Date().toISOString() });
-  res.json({ status: 'STOPPED', message: 'TCP listener stopped.' });
+  try {
+    const analyzer = await getAnalyzerOr404(req, res);
+    if (!analyzer) return;
+
+    if (analyzer.tcp_mode === 'SERVER') {
+      const server = dynamicServers[analyzer._id];
+      if (server) {
+        server.close();
+        delete dynamicServers[analyzer._id];
+      }
+    } else {
+      const client = dynamicClients[analyzer._id];
+      if (client) {
+        client.destroy();
+        delete dynamicClients[analyzer._id];
+      }
+    }
+
+    await AnalyzerConfig.findByIdAndUpdate(req.params.id, { connection_status: 'STOPPED', updated_at: new Date().toISOString() });
+    res.json({ success: true, status: 'STOPPED', message: 'Connection stopped.' });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
 app.post('/api/machine-integration/analyzers/:id/simulate', requireMachineAdmin, async (req, res) => {
@@ -348,7 +465,7 @@ app.post('/api/connect-network', async (req, res) => {
       }
       if (activePort.isSerial) activePort.close();
       else if (activePort.isNetwork) activePort.destroy();
-      
+
       activePort = null;
       parser = null;
       tcpBuffer = '';
@@ -372,11 +489,11 @@ app.post('/api/connect-network', async (req, res) => {
       const chunk = data.toString('utf-8');
       console.log('Raw chunk from network:', chunk);
       emitUpdate('raw-analyzer-data', { raw: chunk });
-      
+
       tcpBuffer += chunk;
       let lines = tcpBuffer.split(/\r?\n/);
       tcpBuffer = lines.pop(); // keep the last incomplete part in the buffer
-      
+
       for (const line of lines) {
         if (line.trim()) {
           console.log('Raw Data from Network Machine (line):', line);
@@ -427,7 +544,7 @@ app.post('/api/disconnect', async (req, res) => {
       } else if (p.isNetwork) {
         p.destroy();
       }
-      
+
       emitUpdate('machine-disconnected', { path });
       activePort = null;
       parser = null;
@@ -479,7 +596,7 @@ app.get('/api/port/status', (req, res) => {
   try {
     let isConnected = false;
     let pathName = null;
-    
+
     if (activePort) {
       if (activePort.isSerial && activePort.isOpen) {
         isConnected = true;
@@ -489,7 +606,7 @@ app.get('/api/port/status', (req, res) => {
         pathName = activePort.path;
       }
     }
-    
+
     const status = activePort?.isSerial && isConnected
       ? (activePort.machineResponding ? 'Connected' : 'Waiting')
       : (isConnected ? 'Connected' : 'Disconnected');
@@ -637,7 +754,7 @@ app.post('/api/patients/:id/tests', async (req, res) => {
   try {
     const { id } = req.params;
     const { testName, machineName } = req.body;
-    
+
     const result = await Result.create({
       patient_id: id,
       test_name: testName,
@@ -645,7 +762,7 @@ app.post('/api/patients/:id/tests', async (req, res) => {
       status: 'Pending',
       date: new Date().toISOString(),
     });
-    
+
     res.json({ message: 'Test added successfully', result });
   } catch (err) {
     res.status(500).json({ error: err.message });
