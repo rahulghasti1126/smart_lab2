@@ -60,11 +60,16 @@ export default function Analyzer() {
       if (payload.status) setStatus(payload.status);
     };
 
+    const onUnparsedData = (payload) => {
+      setLogs((prev) => [{ type: 'unparsed', payload, time: new Date() }, ...prev].slice(0, 200));
+    };
+
     socket.on('machine-connected', onMachineConnected);
     socket.on('machine-waiting', onMachineWaiting);
     socket.on('machine-error', onMachineError);
     socket.on('result-created', onResult);
     socket.on('machine-integration-status', onIntegrationStatus);
+    socket.on('machine-unparsed-data', onUnparsedData);
     socket.on('raw-analyzer-data', (payload) => {
       const rawText = payload?.raw || payload?.data || 'No data';
       setLogs((prev) => [{ type: 'raw', text: `Raw stream: ${rawText}`, time: new Date() }, ...prev].slice(0, 200));
@@ -76,6 +81,7 @@ export default function Analyzer() {
       socket.off('machine-error', onMachineError);
       socket.off('result-created', onResult);
       socket.off('machine-integration-status', onIntegrationStatus);
+      socket.off('machine-unparsed-data', onUnparsedData);
       socket.off('raw-analyzer-data');
     };
   }, []);
@@ -383,6 +389,19 @@ export default function Analyzer() {
                  logs.map((log, i) => {
                    if (typeof log === 'string') {
                      return <p key={i}><span className="text-gray-500">[{new Date().toLocaleTimeString()}]</span> {log}</p>;
+                   }
+                   if (log.type === 'unparsed') {
+                     return (
+                       <div key={i} className="mb-2 p-4 border border-yellow-500/40 rounded-xl flex flex-col bg-yellow-900/20 gap-2">
+                         <span className="text-gray-500 text-xs tracking-wider">[{log.time.toLocaleTimeString()}]</span>
+                         <div className="text-yellow-400 font-bold text-sm whitespace-pre-line">
+                           {log.payload.message}
+                         </div>
+                         <div className="text-white font-mono text-xs mt-2 bg-black/50 p-3 rounded overflow-x-auto break-all">
+                           {log.payload.raw}
+                         </div>
+                       </div>
+                     );
                    }
                    if (log.type === 'result') {
                      return (

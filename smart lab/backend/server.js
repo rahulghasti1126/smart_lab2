@@ -621,62 +621,21 @@ const handleAnalyzerData = async (data) => {
   if (!data) return;
   clearPendingMachineTimer();
   pendingMachineCommand = null;
-  const parsed = parseAnalyzerData(data);
-  if (!parsed) {
-    emitUpdate('raw-analyzer-data', { raw: `${data}` });
-    return;
-  }
-
-  const { patientId, testName, resultValue, unit, referenceRange, machineName, status, raw_data } = parsed;
-  const storedPatientId = patientId || 'unknown';
-
-  try {
-    const result = await Result.create({
-      patient_id: storedPatientId,
-      test_name: testName,
-      result_value: resultValue,
-      unit,
-      reference_range: referenceRange,
-      machine_name: machineName,
-      status,
-      date: new Date().toISOString(),
-      raw_data,
-    });
-
-    if (patientId) {
-      const patient = await Patient.findOneAndUpdate(
-        { id: patientId },
-        { status: status === 'completed' ? 'completed' : 'pending' },
-        { new: true }
-      );
-
-      if (patient) {
-        emitUpdate('patient-updated', {
-          id: patientId,
-          status: patient.status,
-        });
-      }
-    }
-
-    const payload = {
-      id: result._id,
-      patient_id: storedPatientId,
-      test_name: testName,
-      result_value: resultValue,
-      unit,
-      reference_range: referenceRange,
-      machine_name: machineName,
-      status,
-      date: result.date,
-      raw_data,
-    };
-    console.log('Emitting result-created:', JSON.stringify(payload));
-    emitUpdate('result-created', payload);
-
-    await logAudit('analyzer_data', `Patient ${storedPatientId}`, 'system', `Parsed result for ${testName}`);
-  } catch (err) {
-    console.error('Analyzer data save error:', err.message);
-  }
+  
+  const rawString = `${data}`;
+  console.log('Handling raw analyzer data:', rawString);
+  
+  // Emit the raw data for UI logging
+  emitUpdate('raw-analyzer-data', { raw: rawString });
+  
+  // First Objective: Do not mock results. Wait for real parser.
+  emitUpdate('machine-unparsed-data', {
+    raw: rawString,
+    message: '⚠ Raw analyzer data received\n⚠ Parser could not identify the result fields'
+  });
+  
+  // We do not save fake values to MongoDB. 
+  // Real patient matching and Result.create will happen when parser is implemented.
 };
 
 app.post('/api/auth/login', async (req, res) => {
