@@ -385,7 +385,12 @@ app.get('/api/ports', async (req, res) => {
 });
 
 app.post('/api/connect', async (req, res) => {
-  const { path, baudRate = 9600, delimiter = '\r\n' } = req.body;
+  let { path, baudRate = 9600, delimiter = '\r\n' } = req.body;
+  
+  // Unescape the literal strings sent from the frontend
+  if (delimiter === '\\n') delimiter = '\n';
+  else if (delimiter === '\\r\\n') delimiter = '\r\n';
+  else if (delimiter === '\\r') delimiter = '\r';
 
   if (!path) {
     return res.status(400).json({ error: 'Serial port path is required.' });
@@ -396,7 +401,7 @@ app.post('/api/connect', async (req, res) => {
     if (activePort && activePort.isOpen) {
       const currentPath = activePort.path || (activePort.settings && activePort.settings.path) || null;
       if (currentPath === path) {
-        return res.json({ message: `Already connected to ${path}` });
+        return res.json({ message: `Already connected to ${path}`, status: 'Waiting' });
       }
       // closing different active port before opening new one
       activePort.close();
@@ -444,8 +449,8 @@ app.post('/api/connect', async (req, res) => {
       }
       activePort.isSerial = true;
       console.log(`Connected to machine on ${path}`);
-      emitUpdate('machine-waiting', { path, status: 'Waiting' });
-      res.json({ message: `Port ${path} opened; waiting for analyzer data.`, status: 'Waiting', portOpen: true, connected: false });
+      emitUpdate('machine-connected', { path, status: 'Connected' });
+      res.json({ message: `Port ${path} opened successfully.`, status: 'Connected', portOpen: true, connected: true });
     });
   } catch (err) {
     res.status(500).json({ error: err.message });

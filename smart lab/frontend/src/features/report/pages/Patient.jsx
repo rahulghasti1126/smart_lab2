@@ -699,7 +699,16 @@ const Patient = () => {
                                                              doctorNotes: 'Generated from live machine stream.'
                                                            });
                                                            alert(`Report generated: ${res.id}`);
-                                                           navigate('/report');
+                                                           navigate('/report', { state: { 
+                                                             ...log.payload, 
+                                                             id: res.id,
+                                                             patient_name: selectedPatientProfile.name,
+                                                             phone: selectedPatientProfile.phone,
+                                                             email: selectedPatientProfile.email,
+                                                             date: new Date().toISOString(),
+                                                             report_type: log.payload.test_name || 'Machine Test'
+                                                           } });
+
                                                          } catch (err) {
                                                            alert('Failed to generate report: ' + err.message);
                                                          }
