@@ -1,18 +1,17 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { buildFallbackAnalyzerResult } from '../analyzerAutomation.js';
+import { createSimulatorMessage } from '../machineIntegration/simulator.js';
+import { parseHl7Message } from '../machineIntegration/parsers/hl7Parser.js';
 
-test('builds a fallback result payload for a patient', () => {
-  const payload = buildFallbackAnalyzerResult({
-    id: 'P123',
-    name: 'Asha',
-    test_type: 'Thyroid Profile (T3, T4, TSH)',
-  }, 'Biochemistry Analyzer');
+test('simulator uses a parseable protocol message instead of inventing clinical values in a fallback path', () => {
+  const raw = createSimulatorMessage({
+    protocol: 'HL7',
+    sampleId: 'LAB-20261008-0001',
+    patientId: 'P123',
+    parameters: { GLU: { value: '95', unit: 'mg/dL', referenceRange: '70-99', abnormalFlag: 'N' } },
+  });
 
-  assert.ok(payload);
-  assert.equal(payload.patientId, 'P123');
-  assert.equal(payload.testName, 'Thyroid Profile (T3, T4, TSH)');
-  assert.equal(payload.machineName, 'Biochemistry Analyzer');
-  assert.equal(payload.status, 'completed');
-  assert.match(payload.resultValue, /\d/);
+  const parsed = parseHl7Message(raw);
+  assert.equal(parsed.sampleId, 'LAB-20261008-0001');
+  assert.equal(parsed.parameters.GLU.value, '95');
 });

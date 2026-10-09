@@ -16,6 +16,7 @@ import History from "../features/report/pages/History";
 import MachineIntegration from "../features/machineIntegration/pages/MachineIntegration";
 import MachineResults from "../features/machineIntegration/pages/MachineResults";
 import RawMessages from "../features/machineIntegration/pages/RawMessages";
+import UnmatchedResults from "../features/machineIntegration/pages/UnmatchedResults";
 import './App.css'
 // Private Route Component
 const PrivateRoute = ({ children }) => {
@@ -42,7 +43,7 @@ function App() {
       <RouteIndexing />
       <Routes>
         <Route path="/" element={<Login />} />
-        <Route path="/register" element={<Register />} />
+        <Route path="/register" element={<PrivateRoute><Register /></PrivateRoute>} />
         <Route path="/home" element={
           <PrivateRoute>
             <Home />
@@ -108,6 +109,7 @@ function App() {
             <RawMessages />
           </PrivateRoute>
         } />
+        <Route path="/unmatched-results" element={<PrivateRoute><UnmatchedResults /></PrivateRoute>} />
         <Route path="/report" element={
           <PrivateRoute>
             <ReportPage />

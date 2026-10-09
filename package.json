@@ -9,6 +9,7 @@
     "build:frontend": "npm run build --prefix \"smart lab/frontend\"",
     "build": "npm run build:frontend",
     "start": "npm run start --prefix \"smart lab/backend\"",
+    "start:gateway": "npm run gateway --prefix \"smart lab/backend\"",
     "dev": "concurrently \"npm run dev:backend\" \"npm run dev:frontend\""
   },
   "devDependencies": {

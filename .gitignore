@@ -22,6 +22,7 @@ backend/.env
 err.txt
 out.txt
 smart lab/backend/.env
+smart lab/backend/.env.gateway
 smart lab/backend/*.db
 smart lab/backend/err.txt
 smart lab/backend/out.txt

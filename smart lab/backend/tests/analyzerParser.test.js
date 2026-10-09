@@ -24,12 +24,7 @@ test('parses comma-delimited analyzer result', () => {
   assert.equal(parsed.status, 'completed');
 });
 
-test('falls back to a generic result when format is unknown', () => {
+test('does not manufacture a result when format is unknown', () => {
   const parsed = parseAnalyzerData('Immunoassay analyzer sample received');
-
-  assert.ok(parsed);
-  assert.equal(parsed.patientId, null);
-  assert.equal(parsed.testName, 'Analyzer Data');
-  assert.equal(parsed.resultValue, 'Immunoassay analyzer sample received');
-  assert.equal(parsed.status, 'pending');
+  assert.equal(parsed, null);
 });

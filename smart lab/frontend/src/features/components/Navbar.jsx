@@ -1,12 +1,14 @@
 import React from "react";
 import { Link, useNavigate } from "react-router-dom";
 import { motion } from "framer-motion";
+import socket from '../../app/socket';
 
 const Navbar = () => {
   const navigate = useNavigate();
   const user = JSON.parse(localStorage.getItem("user") || "{}");
 
   const handleLogout = () => {
+    socket.disconnect();
     localStorage.removeItem("user");
     navigate("/");
   };
@@ -54,9 +56,7 @@ const Navbar = () => {
               { name: "Reagents", path: "/reagents" },
               { name: "Billing", path: "/billing" },
               { name: "History", path: "/history" },
-              { name: "Machine Integration", path: "/machine-integration" },
-              { name: "Machine Results", path: "/machine-results" },
-              { name: "Raw Messages", path: "/raw-messages" },
+              { name: "Unmatched", path: "/unmatched-results" },
             ].map((item, i) => (
               <motion.div key={i} whileHover={{ scale: 1.1 }}>
                 <Link

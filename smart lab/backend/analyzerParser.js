@@ -95,17 +95,9 @@ const parseAnalyzerData = (data) => {
     };
   }
 
-  // Single token fallback
-  return {
-    patientId: null,
-    testName: 'Analyzer Data',
-    resultValue: normalized,
-    unit: '',
-    referenceRange: '',
-    machineName: 'Connected Machine',
-    status: isNumeric(normalized) ? 'completed' : 'pending',
-    raw_data: normalized,
-  };
+  // An unrecognized payload is raw diagnostic material, not a clinical
+  // result. The protocol adapter will retain it for investigation.
+  return null;
 };
 
 export { parseAnalyzerData };

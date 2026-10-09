@@ -1,5 +1,9 @@
 import express from 'express';
 import cors from 'cors';
+import helmet from 'helmet';
+import rateLimit from 'express-rate-limit';
+import PDFDocument from 'pdfkit';
+import nodemailer from 'nodemailer';
 import { createServer } from 'http';
 import { Server } from 'socket.io';
 import { SerialPort } from 'serialport';
@@ -8,23 +12,55 @@ import net from 'net';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { dirname } from 'path';
-import { connectDB, hashPassword, User, Patient, Result, AnalyzerConfig, AnalyzerMessage, AnalyzerResult, Reagent, Report, Invoice, LabSettings, AuditLog } from './database.js';
+import crypto from 'crypto';
+import jwt from 'jsonwebtoken';
+import authRoutes from './routes/authRoutes.js';
+import { connectDB, User, Patient, Sample, Test, Result, AnalyzerConfig, AnalyzerMessage, AnalyzerResult, Reagent, Report, Invoice, LabSettings, AuditLog } from './database.js';
 import { parseAnalyzerData } from './analyzerParser.js';
+import { getProtocolAdapter } from './machineIntegration/protocolRegistry.js';
 import { createMachineIntegrationService } from './machineIntegration/service.js';
 import { createSimulatorMessage } from './machineIntegration/simulator.js';
 import { validateAnalyzerConfig } from './machineIntegration/validation.js';
-import { startCippointTcpServer, getCippointTcpServer, stopCippointTcpServer } from './machineIntegration/cippointTcpServer.js';
+import { AnalyzerConnectionManager } from './machineIntegration/communication/connectionManager.js';
+import { protect, allowRoles } from './middleware/auth.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 
 const app = express();
-app.use(cors({ origin: true }));
+const allowedOrigins = process.env.CORS_ORIGINS?.split(',').map((origin) => origin.trim()).filter(Boolean) || ['http://localhost:5173'];
+app.use(helmet({ crossOriginResourcePolicy: false }));
+app.use(cors({
+  origin(origin, callback) {
+    if (!origin || allowedOrigins.includes(origin)) return callback(null, true);
+    return callback(new Error('CORS origin is not allowed.'));
+  },
+}));
 app.use(express.json({ limit: '6mb' }));
+
+app.use('/api/auth', rateLimit({ windowMs: 15 * 60 * 1000, max: 20, standardHeaders: true, legacyHeaders: false }));
+app.use('/api/auth', authRoutes);
+// Hardware gateways authenticate with their separately scoped token. All
+// browser/API routes after login require a signed JWT.
+app.use('/api', (req, res, next) => req.path.startsWith('/machine-integration/gateway/') ? next() : protect(req, res, next));
 
 const httpServer = createServer(app);
 const io = new Server(httpServer, {
-  cors: { origin: '*' },
+  cors: { origin: allowedOrigins },
+});
+
+io.use(async (socket, next) => {
+  try {
+    const token = socket.handshake.auth?.token;
+    if (!token || !process.env.JWT_SECRET) return next(new Error('Authentication is required.'));
+    const decoded = jwt.verify(token, process.env.JWT_SECRET);
+    const user = await User.findOne({ id: decoded.id }).select('id role');
+    if (!user) return next(new Error('User account not found.'));
+    socket.user = user;
+    return next();
+  } catch {
+    return next(new Error('Session is invalid or expired.'));
+  }
 });
 
 io.on('connection', (socket) => {
@@ -38,37 +74,29 @@ const emitUpdate = (event, payload) => {
   io.emit(event, payload);
 };
 
-const machineIntegration = createMachineIntegrationService({ AnalyzerMessage, AnalyzerResult, AuditLog, emit: emitUpdate });
+const machineIntegration = createMachineIntegrationService({ AnalyzerMessage, AnalyzerResult, Sample, Result, Test, AuditLog, emit: emitUpdate });
+const gatewayStatuses = new Set(['CONNECTED', 'DATA RECEIVED', 'WAITING_FOR_ANALYZER', 'WAITING FOR ANALYZER', 'DISCONNECTED', 'RECONNECTING', 'ERROR']);
+const connectionManager = new AnalyzerConnectionManager({ AnalyzerConfig, AuditLog, machineIntegration, emit: emitUpdate });
 
-const handleCippointStatus = async (status, details) => {
-  const analyzer = await AnalyzerConfig.findOne({ name: 'Cippoint' });
-  if (analyzer) await AnalyzerConfig.findByIdAndUpdate(analyzer._id, { connection_status: status, updated_at: new Date().toISOString() });
-  if (status === 'ERROR') console.error(`Cippoint listener error: ${details?.error || 'Unknown TCP server error'}`);
-  emitUpdate('machine-integration-status', { analyzerId: analyzer?._id, status, details, error: details?.error || null });
-};
+const requireMachineGatewayToken = (req, res, next) => {
+  const configuredToken = process.env.MACHINE_GATEWAY_TOKEN;
+  const authorization = req.get('authorization') || '';
+  const suppliedToken = authorization.startsWith('Bearer ') ? authorization.slice(7) : '';
 
-const handleCippointData = async (rawData, details) => {
-  const analyzer = await AnalyzerConfig.findOne({ name: 'Cippoint' });
-  if (!analyzer) return console.error('Cippoint raw message was received, but no Cippoint analyzer configuration exists.');
-  try {
-    await machineIntegration.receiveRawMessage({ analyzer, rawMessage: rawData, sourceIp: details.remoteIp, connectionAt: details.connectionAt, captureOnly: true });
-  } catch (error) {
-    console.error(`Cippoint raw message storage error: ${error.message}`);
-    await handleCippointStatus('ERROR', { ...details, error: error.message });
+  if (!configuredToken || configuredToken.length < 32) {
+    return res.status(503).json({ error: 'Machine gateway is not configured on this server.' });
   }
+
+  const supplied = Buffer.from(suppliedToken);
+  const configured = Buffer.from(configuredToken);
+  if (supplied.length !== configured.length || !crypto.timingSafeEqual(supplied, configured)) {
+    return res.status(401).json({ error: 'Invalid machine gateway credentials.' });
+  }
+
+  next();
 };
 
-const requireMachineAdmin = async (req, res, next) => {
-  try {
-    const userId = req.headers['x-user-id'];
-    const user = userId ? await User.findOne({ id: userId }).select('role') : null;
-    if (user?.role !== 'admin') return res.status(403).json({ error: 'Administrator access is required.' });
-    req.machineAdmin = userId;
-    next();
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-};
+const requireMachineAdmin = allowRoles('admin');
 
 const getAnalyzerOr404 = async (req, res) => {
   const analyzer = await AnalyzerConfig.findById(req.params.id);
@@ -78,6 +106,28 @@ const getAnalyzerOr404 = async (req, res) => {
   }
   return analyzer;
 };
+
+app.get('/api/users', allowRoles('admin'), async (req, res) => {
+  try {
+    res.json(await User.find().select('id username name role created_at').sort({ created_at: -1 }).lean());
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.patch('/api/users/:id/role', allowRoles('admin'), async (req, res) => {
+  try {
+    const role = String(req.body?.role || '');
+    if (!['admin', 'pathologist', 'technician'].includes(role)) return res.status(400).json({ error: 'Invalid laboratory role.' });
+    if (req.params.id === req.user.id && role !== 'admin') return res.status(409).json({ error: 'You cannot remove your own administrator role.' });
+    const user = await User.findOneAndUpdate({ id: req.params.id }, { role }, { new: true }).select('id username name role');
+    if (!user) return res.status(404).json({ error: 'User not found.' });
+    await logAudit('user_role_changed', user.id, req.user.id, `${user.username} role set to ${role}`, { req, entity: 'User', newValue: { role } });
+    res.json(user);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
 
 app.get('/api/machine-integration/analyzers', async (req, res) => {
   try {
@@ -89,24 +139,38 @@ app.get('/api/machine-integration/analyzers', async (req, res) => {
 
 app.post('/api/machine-integration/analyzers', requireMachineAdmin, async (req, res) => {
   try {
-    const input = { ...req.body, model: req.body?.model || 'Cippoint Immunofluorescence Quantitative Analyzer', tcpMode: req.body?.tcpMode || 'CLIENT' };
+    const input = { ...req.body, model: req.body?.model || '', tcpMode: req.body?.tcpMode || 'CLIENT' };
     const validation = validateAnalyzerConfig(input);
     if (!validation.valid) return res.status(400).json({ error: validation.errors.join(' ') });
     const analyzer = await AnalyzerConfig.create({
       name: input.name.trim(),
       model: input.model,
-      ip_address: input.ipAddress.trim(),
-      server_ip: input.serverIp.trim(),
-      port: Number(input.port),
+      manufacturer: input.manufacturer || '',
+      category: input.category || '',
+      analyzer_id: input.analyzerId?.trim() || undefined,
+      ip_address: input.ipAddress?.trim() || '',
+      server_ip: input.serverIp?.trim() || '',
+      port: Number(input.port) || undefined,
       connection_type: input.connectionType || 'NETWORK',
+      serial_port: input.serialPort || '',
+      baud_rate: Number(input.baudRate) || 9600,
+      data_bits: Number(input.dataBits) || 8,
+      stop_bits: Number(input.stopBits) || 1,
+      parity: input.parity || 'none',
+      flow_control: input.flowControl || 'none',
+      server_port: Number(input.serverPort) || undefined,
       tcp_mode: input.tcpMode,
       protocol: input.protocol,
+      protocol_options: input.protocolOptions || {},
+      remote_control_supported: Boolean(input.remoteControlSupported),
       auto_connect: Boolean(input.autoConnect),
       auto_receive: input.autoReceive !== false,
+      timeout: Number(input.timeout) || 30000,
+      reconnect_interval: Number(input.reconnectInterval) || 5000,
       enabled: Boolean(input.enabled),
       updated_at: new Date().toISOString(),
     });
-    await logAudit('analyzer_configured', String(analyzer._id), req.headers['x-user-id'] || 'admin', `Configured ${analyzer.name}`);
+    await logAudit('analyzer_configured', String(analyzer._id), req.user.id, `Configured ${analyzer.name}`);
     res.status(201).json(analyzer);
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -117,20 +181,34 @@ app.patch('/api/machine-integration/analyzers/:id', requireMachineAdmin, async (
   try {
     const analyzer = await getAnalyzerOr404(req, res);
     if (!analyzer) return;
-    const input = { ...analyzer.toObject(), ...req.body, ipAddress: req.body.ipAddress ?? analyzer.ip_address, serverIp: req.body.serverIp ?? analyzer.server_ip, tcpMode: req.body.tcpMode ?? analyzer.tcp_mode };
+    const input = { ...analyzer.toObject(), ...req.body, ipAddress: req.body.ipAddress ?? analyzer.ip_address, serverIp: req.body.serverIp ?? analyzer.server_ip, serialPort: req.body.serialPort ?? analyzer.serial_port, tcpMode: req.body.tcpMode ?? analyzer.tcp_mode, connectionType: req.body.connectionType ?? analyzer.connection_type };
     const validation = validateAnalyzerConfig(input);
     if (!validation.valid) return res.status(400).json({ error: validation.errors.join(' ') });
     Object.assign(analyzer, {
       name: input.name,
-      model: input.model || analyzer.model,
-      ip_address: input.ipAddress,
-      server_ip: input.serverIp,
-      port: Number(input.port),
+      analyzer_id: input.analyzerId ?? input.analyzer_id ?? analyzer.analyzer_id,
+      model: input.model ?? analyzer.model,
+      manufacturer: input.manufacturer ?? analyzer.manufacturer,
+      category: input.category ?? analyzer.category,
+      ip_address: input.ipAddress || '',
+      server_ip: input.serverIp || '',
+      port: Number(input.port) || undefined,
       connection_type: input.connectionType || analyzer.connection_type,
+      serial_port: input.serialPort ?? analyzer.serial_port,
+      baud_rate: input.baudRate ? Number(input.baudRate) : analyzer.baud_rate,
+      data_bits: input.dataBits ? Number(input.dataBits) : analyzer.data_bits,
+      stop_bits: input.stopBits ? Number(input.stopBits) : analyzer.stop_bits,
+      parity: input.parity ?? analyzer.parity,
+      flow_control: input.flowControl ?? analyzer.flow_control,
+      server_port: input.serverPort ? Number(input.serverPort) : analyzer.server_port,
       tcp_mode: input.tcpMode,
       protocol: input.protocol,
+      protocol_options: input.protocolOptions ?? analyzer.protocol_options,
+      remote_control_supported: input.remoteControlSupported ?? analyzer.remote_control_supported,
       auto_connect: input.autoConnect ?? analyzer.auto_connect,
       auto_receive: input.autoReceive ?? analyzer.auto_receive,
+      timeout: input.timeout ? Number(input.timeout) : analyzer.timeout,
+      reconnect_interval: input.reconnectInterval ? Number(input.reconnectInterval) : analyzer.reconnect_interval,
       enabled: Boolean(input.enabled),
       updated_at: new Date().toISOString(),
     });
@@ -145,29 +223,56 @@ app.post('/api/machine-integration/analyzers/:id/test-connection', requireMachin
   try {
     const analyzer = await getAnalyzerOr404(req, res);
     if (!analyzer) return;
+    const test = await connectionManager.testConnection(analyzer);
+    await logAudit('analyzer_connection_tested', String(analyzer._id), req.user.id, `${analyzer.name}: ${test.status || 'TCP reachable'}`);
+    res.json({ connected: Boolean(test.reachable), status: test.status || (test.reachable ? 'TCP_REACHABLE' : 'NOT_CONNECTED'), ...test });
+  } catch (err) {
+    await AnalyzerConfig.findByIdAndUpdate(req.params.id, { connection_status: 'ERROR', updated_at: new Date().toISOString() });
+    res.status(502).json({ error: `Connection test failed: ${err.message}` });
+  }
+});
 
-    let isConnected = false;
-    let status = 'STOPPED';
-
-    if (analyzer.tcp_mode === 'SERVER') {
-      const server = dynamicServers[analyzer._id];
-      isConnected = Boolean(server && server.listening);
-      status = isConnected ? 'WAITING FOR ANALYZER' : 'STOPPED';
-    } else {
-      const client = dynamicClients[analyzer._id];
-      isConnected = Boolean(client && !client.destroyed);
-      status = isConnected ? 'CONNECTED' : 'STOPPED';
+app.post('/api/machine-integration/gateway/:id/messages', requireMachineGatewayToken, async (req, res) => {
+  try {
+    const analyzer = await AnalyzerConfig.findById(req.params.id);
+    if (!analyzer) return res.status(404).json({ error: 'Analyzer not found.' });
+    if (analyzer.tcp_mode !== 'SERVER') {
+      return res.status(409).json({ error: 'Analyzer TCP mode must be SERVER for a local gateway.' });
     }
 
-    res.json({
-      connected: isConnected,
-      status,
-      message: isConnected ? 'Connection is active.' : 'Connection is inactive.',
-      host: analyzer.tcp_mode === 'SERVER' ? analyzer.server_ip : analyzer.ip_address,
-      port: analyzer.port,
+    const result = await machineIntegration.receiveRawMessage({
+      analyzer,
+      rawMessage: req.body?.rawMessage,
+      sourceIp: req.body?.sourceIp,
+      connectionAt: req.body?.connectionAt,
+      source: 'local-gateway',
     });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
+    res.status(result.duplicate ? 200 : 201).json({ received: true, duplicate: Boolean(result.duplicate) });
+  } catch (error) {
+    const status = ['PROTOCOL_UNAVAILABLE', 'PROTOCOL_SPECIFICATION_REQUIRED'].includes(error.code)
+      ? 422
+      : error.message === 'Raw message is required.' || error.message === 'Raw message is too large.' ? 400 : 500;
+    res.status(status).json({ error: error.message });
+  }
+});
+
+app.post('/api/machine-integration/gateway/:id/status', requireMachineGatewayToken, async (req, res) => {
+  try {
+    const { status, details = {} } = req.body || {};
+    if (!gatewayStatuses.has(status)) {
+      return res.status(400).json({ error: 'Unsupported machine gateway status.' });
+    }
+
+    const analyzer = await AnalyzerConfig.findByIdAndUpdate(
+      req.params.id,
+      { connection_status: status, updated_at: new Date().toISOString() },
+      { new: true }
+    );
+    if (!analyzer) return res.status(404).json({ error: 'Analyzer not found.' });
+    emitUpdate('machine-integration-status', { analyzerId: analyzer._id, status, details });
+    res.json({ updated: true, status });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
   }
 });
 
@@ -178,6 +283,10 @@ app.post('/api/machine-integration/analyzers/:id/connect', requireMachineAdmin, 
   try {
     const analyzer = await getAnalyzerOr404(req, res);
     if (!analyzer) return;
+
+    const session = await connectionManager.connect(analyzer);
+    await logAudit('analyzer_connect_requested', String(analyzer._id), req.user.id, `${analyzer.name}: ${session.status}`);
+    return res.json({ ...session, analyzerId: analyzer._id, message: session.status === 'WAITING_FOR_ANALYZER' ? 'LIS listener is active and awaiting the analyzer.' : 'Analyzer connection established.' });
 
     if (analyzer.tcp_mode === 'SERVER') {
       if (dynamicServers[analyzer._id]) {
@@ -196,7 +305,7 @@ app.post('/api/machine-integration/analyzers/:id/connect', requireMachineAdmin, 
           handleAnalyzerData(rawData);
 
           try {
-            await machineIntegration.receiveRawMessage({ analyzer, rawMessage: rawData, sourceIp: remoteIp, connectionAt: new Date().toISOString(), captureOnly: true });
+            await machineIntegration.receiveRawMessage({ analyzer, rawMessage: rawData, sourceIp: remoteIp, connectionAt: new Date().toISOString() });
           } catch (error) {
             console.error(`Message storage error: ${error.message}`);
           }
@@ -246,7 +355,7 @@ app.post('/api/machine-integration/analyzers/:id/connect', requireMachineAdmin, 
         }
 
         try {
-          await machineIntegration.receiveRawMessage({ analyzer, rawMessage: str, sourceIp: analyzer.ip_address, connectionAt: new Date().toISOString(), captureOnly: true });
+          await machineIntegration.receiveRawMessage({ analyzer, rawMessage: str, sourceIp: analyzer.ip_address, connectionAt: new Date().toISOString() });
         } catch (error) {
           console.error(`Message storage error: ${error.message}`);
         }
@@ -277,6 +386,10 @@ app.post('/api/machine-integration/analyzers/:id/disconnect', requireMachineAdmi
     const analyzer = await getAnalyzerOr404(req, res);
     if (!analyzer) return;
 
+    await connectionManager.disconnect(analyzer);
+    await logAudit('analyzer_disconnected', String(analyzer._id), req.user.id, `Disconnected ${analyzer.name}`);
+    return res.json({ success: true, status: 'DISCONNECTED', message: 'Connection stopped.' });
+
     if (analyzer.tcp_mode === 'SERVER') {
       const server = dynamicServers[analyzer._id];
       if (server) {
@@ -302,8 +415,11 @@ app.post('/api/machine-integration/analyzers/:id/simulate', requireMachineAdmin,
   try {
     const analyzer = await getAnalyzerOr404(req, res);
     if (!analyzer) return;
-    const rawMessage = req.body?.rawMessage || createSimulatorMessage(req.body);
-    const result = await machineIntegration.receiveRawMessage({ analyzer, rawMessage, sourceIp: 'simulator', source: 'simulator', captureOnly: true });
+    const rawMessage = req.body?.rawMessage || createSimulatorMessage({ ...req.body, protocol: analyzer.protocol });
+    // The simulator deliberately enters the same production pipeline as a
+    // physical adapter; it is visibly recorded as source=simulator.
+    const result = await machineIntegration.receiveRawMessage({ analyzer, rawMessage, sourceIp: 'simulator', source: 'simulator' });
+    await logAudit('analyzer_simulation_received', String(analyzer._id), req.user.id, `Simulator ran through ${analyzer.protocol} pipeline.`);
     res.status(201).json(result);
   } catch (err) {
     res.status(['PROTOCOL_UNAVAILABLE', 'PROTOCOL_SPECIFICATION_REQUIRED'].includes(err.code) ? 422 : 500).json({ error: err.message, code: err.code });
@@ -326,13 +442,147 @@ app.get('/api/machine-integration/results', async (req, res) => {
   }
 });
 
+app.get('/api/machine-integration/unmatched-results', allowRoles('admin', 'technician', 'pathologist'), async (req, res) => {
+  try {
+    const results = await AnalyzerResult.find({ $or: [{ processing_status: 'UNMATCHED' }, { match_status: 'UNMATCHED' }] })
+      .sort({ received_at: -1 }).limit(200).lean();
+    res.json(results);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post('/api/machine-integration/unmatched-results/:id/resolve', allowRoles('admin', 'technician'), async (req, res) => {
+  try {
+    const sampleId = String(req.body?.sampleId || '').trim();
+    const reason = String(req.body?.reason || '').trim();
+    if (!sampleId || !reason) return res.status(400).json({ error: 'Sample ID and resolution reason are required.' });
+    const [analyzerResult, sample] = await Promise.all([
+      AnalyzerResult.findById(req.params.id),
+      Sample.findOne({ sample_id: sampleId }),
+    ]);
+    if (!analyzerResult) return res.status(404).json({ error: 'Analyzer result not found.' });
+    if (!sample) return res.status(404).json({ error: 'The selected Sample ID does not exist.' });
+    if (analyzerResult.processing_status !== 'UNMATCHED') return res.status(409).json({ error: 'This result has already been resolved or requires a different workflow.' });
+
+    const normalized = analyzerResult.normalized_results || [];
+    if (!normalized.length) return res.status(409).json({ error: 'This legacy result has no normalized parameters and cannot be safely resolved automatically.' });
+    for (const parameter of normalized) {
+      await Result.findOneAndUpdate(
+        { sample_id: sample.sample_id, test_code: parameter.testCode },
+        { $set: {
+          patient_id: sample.patient_id, sample_id: sample.sample_id, test_code: parameter.testCode,
+          test_name: parameter.testName, result_value: parameter.resultValue, unit: parameter.unit,
+          reference_range: parameter.referenceRange, machine_name: analyzerResult.analyzer_name,
+          status: 'VALIDATION_PENDING', date: new Date().toISOString(), raw_data: JSON.stringify(parameter), analyzer_result_id: analyzerResult._id,
+        } },
+        { upsert: true, new: true, setDefaultsOnInsert: true }
+      );
+    }
+    const oldValue = analyzerResult.toObject();
+    analyzerResult.patient_id = sample.patient_id;
+    analyzerResult.sample_id = sample.sample_id;
+    analyzerResult.processing_status = 'VALIDATION_PENDING';
+    analyzerResult.match_status = 'MANUALLY_RESOLVED';
+    analyzerResult.matched_sample_id = sample.sample_id;
+    analyzerResult.review_reason = reason;
+    await Promise.all([analyzerResult.save(), Sample.findByIdAndUpdate(sample._id, { status: 'VALIDATION_PENDING' })]);
+    await logAudit('unmatched_result_resolved', String(analyzerResult._id), req.user.id, `Manually matched to ${sample.sample_id}: ${reason}`, { req, entity: 'AnalyzerResult', oldValue, newValue: analyzerResult.toObject() });
+    res.json(analyzerResult);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.get('/api/patients/:id/machine-results', async (req, res) => {
+  try {
+    const patientId = req.params.id.trim();
+    if (!patientId) return res.status(400).json({ error: 'Patient ID is required.' });
+
+    const escapedPatientId = patientId.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const exactIdentifier = new RegExp(`^${escapedPatientId}$`, 'i');
+    const rawMessageMatch = new RegExp(escapedPatientId, 'i');
+    const [storedResults, messages] = await Promise.all([
+      AnalyzerResult.find({
+        $or: [
+          { patient_id: exactIdentifier },
+          { sample_id: exactIdentifier },
+          { barcode: exactIdentifier },
+          { order_id: exactIdentifier },
+        ],
+      }).sort({ received_at: -1 }).limit(200).lean(),
+      AnalyzerMessage.find({ raw_message: rawMessageMatch })
+        .populate('analyzer_id', 'protocol name')
+        .sort({ received_at: -1 })
+        .limit(200)
+        .lean(),
+    ]);
+
+    const savedResults = storedResults.map((result) => ({
+      ...result,
+      parameters: result.reviewed_parameters || result.parameters || {},
+    }));
+
+    const resultsByMessage = new Map(savedResults.map((result) => [String(result.message_id), result]));
+    const matchingResults = [...savedResults];
+
+    for (const message of messages) {
+      const analyzer = message.analyzer_id;
+      if (!analyzer?.protocol) continue;
+
+      try {
+        const parsed = getProtocolAdapter(analyzer.protocol).parse(message.raw_message);
+        const identifiers = [parsed.patientId, parsed.sampleId, parsed.barcode, parsed.orderId]
+          .filter(Boolean)
+          .map((value) => String(value).trim().toLowerCase());
+        if (!identifiers.includes(patientId.toLowerCase())) continue;
+
+        const existingResult = resultsByMessage.get(String(message._id));
+        matchingResults.push({
+          ...(existingResult || {}),
+          _id: existingResult?._id || message._id,
+          message_id: message._id,
+          analyzer_name: existingResult?.analyzer_name || message.analyzer_name || analyzer.name,
+          patient_id: existingResult?.patient_id || parsed.patientId || '',
+          sample_id: existingResult?.sample_id || parsed.sampleId || '',
+          order_id: existingResult?.order_id || parsed.orderId || '',
+          barcode: existingResult?.barcode || parsed.barcode || '',
+          parameters: existingResult?.parameters || parsed.parameters || {},
+          received_at: existingResult?.received_at || message.received_at,
+          processing_status: existingResult?.processing_status || 'UNMATCHED',
+        });
+      } catch (error) {
+        console.error(`Could not parse historical analyzer message ${message._id}: ${error.message}`);
+        if (message.raw_message.toLowerCase().includes(patientId.toLowerCase())) {
+          matchingResults.push({
+            _id: message._id,
+            message_id: message._id,
+            analyzer_name: message.analyzer_name || analyzer.name,
+            received_at: message.received_at,
+            processing_status: 'ERROR',
+            parse_error: error.message,
+            raw_message: message.raw_message,
+            parameters: {},
+          });
+        }
+      }
+    }
+
+    const uniqueResults = [...new Map(matchingResults.map((result) => [String(result.message_id || result._id), result])).values()]
+      .sort((a, b) => new Date(b.received_at || 0) - new Date(a.received_at || 0));
+    res.json(uniqueResults);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 let activePort = null;
 let parser = null;
 let tcpBuffer = '';
 let pendingMachineCommand = null;
 let pendingMachineTimer = null;
 
-const logAudit = async (event, subject, actor, details) => {
+const logAudit = async (event, subject, actor, details, { req, entity = '', oldValue, newValue } = {}) => {
   try {
     if (AuditLog && typeof AuditLog.create === 'function') {
       await AuditLog.create({
@@ -341,29 +591,18 @@ const logAudit = async (event, subject, actor, details) => {
         actor,
         timestamp: new Date().toISOString(),
         details: details || '',
+        action: event,
+        entity,
+        entity_id: subject,
+        role: req?.user?.role || '',
+        ip_address: req?.ip || '',
+        old_value: oldValue,
+        new_value: newValue,
       });
     }
   } catch (err) {
     console.error('Audit log failed:', err?.message || err);
   }
-};
-
-const ensureCippointConfiguration = async () => {
-  const existing = await AnalyzerConfig.findOne({ name: 'Cippoint' });
-  if (existing) return existing;
-  return AnalyzerConfig.create({
-    name: 'Cippoint',
-    model: 'Cippoint Immunofluorescence Quantitative Analyzer',
-    ip_address: '192.168.1.12',
-    server_ip: '192.168.1.10',
-    port: 8001,
-    connection_type: 'NETWORK',
-    tcp_mode: 'SERVER',
-    protocol: 'HL7',
-    auto_receive: true,
-    enabled: true,
-    connection_status: 'STOPPED',
-  });
 };
 
 const clearPendingMachineTimer = () => {
@@ -385,6 +624,7 @@ app.get('/api/ports', async (req, res) => {
 });
 
 app.post('/api/connect', async (req, res) => {
+  return res.status(410).json({ error: 'Direct legacy connections are disabled. Create an analyzer configuration so data uses the audited integration pipeline.' });
   let { path, baudRate = 9600, delimiter = '\r\n' } = req.body;
   
   // Unescape the literal strings sent from the frontend
@@ -458,6 +698,7 @@ app.post('/api/connect', async (req, res) => {
 });
 
 app.post('/api/connect-network', async (req, res) => {
+  return res.status(410).json({ error: 'Direct legacy connections are disabled. Configure the analyzer and use its Connect action.' });
   const { host, port } = req.body;
   if (!host || !port) {
     return res.status(400).json({ error: 'Host and port are required for network connection.' });
@@ -538,6 +779,7 @@ app.post('/api/debug/parse', (req, res) => {
 });
 
 app.post('/api/disconnect', async (req, res) => {
+  return res.status(410).json({ error: 'Direct legacy connections are disabled. Disconnect the configured analyzer instead.' });
   try {
     if (activePort) {
       const p = activePort;
@@ -563,6 +805,7 @@ app.post('/api/disconnect', async (req, res) => {
 });
 
 const sendMachineCommand = async (req, res, action) => {
+  return res.status(501).json({ error: 'Remote Start/Stop is not supported until this analyzer has documented, validated remote-control commands configured.' });
   try {
     const { patientName, patientId, machine, testType } = req.body || {};
     const command = req.body?.command || (action === 'start' ? 'START\r\n' : 'STOP\r\n');
@@ -639,63 +882,16 @@ const handleAnalyzerData = async (data) => {
     message: '⚠ Raw analyzer data received\n⚠ Parser could not identify the result fields'
   });
   
-  // We do not save fake values to MongoDB. 
   // Real patient matching and Result.create will happen when parser is implemented.
 };
 
-app.post('/api/auth/login', async (req, res) => {
-  try {
-    const { username, password } = req.body;
-    const passwordHash = hashPassword(password);
-    const normalizedUsername = username?.toLowerCase?.().trim();
-    const user = await User.findOne({
-      username: new RegExp(`^${normalizedUsername}$`, 'i'),
-      password_hash: passwordHash,
-    }).select('id username name role');
-    if (!user) return res.status(401).json({ error: 'Invalid credentials' });
-    res.json(user);
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-app.post('/api/auth/register', async (req, res) => {
-  try {
-    const { username, password, name, role = 'technician' } = req.body;
-    const normalizedUsername = username?.toLowerCase?.().trim();
-    const normalizedName = name?.trim?.();
-
-    if (!normalizedUsername || !password || !normalizedName) {
-      return res.status(400).json({ error: 'Username, password, and name are required.' });
-    }
-
-    const existing = await User.findOne({ username: normalizedUsername });
-    if (existing) return res.status(409).json({ error: 'Username already exists' });
-
-    const passwordHash = hashPassword(password);
-    const userId = `U${Date.now()}`;
-
-    await User.create({
-      id: userId,
-      username: normalizedUsername,
-      password_hash: passwordHash,
-      name: normalizedName,
-      role,
-      created_at: new Date().toISOString(),
-    });
-
-    await logAudit('user_registered', normalizedUsername, role, `New user ${normalizedUsername} registered as ${role}`);
-    res.json({ id: userId, username: normalizedUsername, name: normalizedName, role });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
 app.post('/api/patients/add', async (req, res) => {
   try {
-    const p = req.body;
+    const p = req.body || {};
+    if (!String(p.patientName || '').trim()) return res.status(400).json({ error: 'Patient name is required.' });
+    if (p.age !== undefined && (!Number.isInteger(Number(p.age)) || Number(p.age) < 0 || Number(p.age) > 130)) return res.status(400).json({ error: 'Age must be between 0 and 130.' });
     const patientId = `P${Date.now()}`;
-    await Patient.create({
+    const patient = await Patient.create({
       id: patientId,
       name: p.patientName,
       age: p.age,
@@ -703,12 +899,14 @@ app.post('/api/patients/add', async (req, res) => {
       phone: p.phone,
       email: p.email,
       doctor: p.doctor,
+      dob: p.dob || '',
+      address: p.address || '',
       date: new Date().toISOString(),
       status: 'pending',
     });
 
-    await logAudit('patient_registered', patientId, p.doctor || 'unknown', `Patient ${p.patientName} registered`);
-    res.json({ id: patientId, message: 'Patient registered successfully' });
+    await logAudit('patient_registered', patientId, req.user.id, `Patient ${p.patientName} registered`, { req, entity: 'Patient' });
+    res.status(201).json({ id: patientId, patient: patient.toObject(), message: 'Patient registered successfully' });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -717,17 +915,53 @@ app.post('/api/patients/add', async (req, res) => {
 app.post('/api/patients/:id/tests', async (req, res) => {
   try {
     const { id } = req.params;
-    const { testName, machineName } = req.body;
+    const { testName, testCode = '', machineName = '', analyzerId } = req.body || {};
+    if (!String(testName || '').trim()) return res.status(400).json({ error: 'Test name is required.' });
+    const patient = await Patient.findOne({ id });
+    if (!patient) return res.status(404).json({ error: 'Patient not found.' });
+    if (analyzerId && !await AnalyzerConfig.findById(analyzerId)) return res.status(404).json({ error: 'Assigned analyzer not found.' });
+
+    // Generate unique sample ID: LAB-YYYYMMDD-XXXX
+    const dateStr = new Date().toISOString().slice(0, 10).replace(/-/g, '');
+    let sampleId;
+    let sample;
+    for (let retry = 0; retry < 4 && !sample; retry += 1) {
+      const sampleCount = await Sample.countDocuments({ sample_id: new RegExp(`^LAB-${dateStr}-`) });
+      sampleId = `LAB-${dateStr}-${String(sampleCount + 1 + retry).padStart(4, '0')}`;
+      try {
+        sample = await Sample.create({
+          sample_id: sampleId, patient_id: id, status: 'REGISTERED', collection_date: new Date().toISOString(),
+          analyzer_id: analyzerId || undefined, tests: [String(testCode || testName)],
+        });
+      } catch (error) {
+        if (error?.code !== 11000) throw error;
+      }
+    }
+    if (!sample) throw new Error('Could not allocate a unique Sample ID. Please retry.');
 
     const result = await Result.create({
       patient_id: id,
+      sample_id: sampleId,
       test_name: testName,
+      test_code: testCode,
       machine_name: machineName,
       status: 'Pending',
       date: new Date().toISOString(),
     });
 
-    res.json({ message: 'Test added successfully', result });
+    await Test.create({
+      test_id: `T${Date.now()}`,
+      sample_id: sampleId,
+      patient_id: id,
+      test_name: testName,
+      test_code: testCode,
+      analyzer_id: analyzerId || undefined,
+      status: 'ASSIGNED',
+      assigned_date: new Date().toISOString()
+    });
+
+    await logAudit('sample_created', sampleId, req.user.id, `Sample assigned: ${testName}`, { req, entity: 'Sample', newValue: sample.toObject() });
+    res.status(201).json({ message: 'Test and Sample added successfully', result, sampleId });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -790,7 +1024,33 @@ app.get('/api/dashboard-stats', async (req, res) => {
   }
 });
 
-app.post('/api/results/add', async (req, res) => {
+app.get('/api/dashboard', async (req, res) => {
+  try {
+    const dayStart = new Date();
+    dayStart.setHours(0, 0, 0, 0);
+    const dayIso = dayStart.toISOString();
+    const [patients, samples, pendingResults, pendingReviews, approvedReports, analyzers, lowStock, revenueRows] = await Promise.all([
+      Patient.countDocuments(),
+      Sample.countDocuments({ collection_date: { $gte: dayIso } }),
+      Result.countDocuments({ status: { $in: ['VALIDATION_PENDING', 'UNASSIGNED_TEST', 'Pending'] } }),
+      Report.countDocuments({ status: { $in: ['DRAFT', 'REVISED'] } }),
+      Report.countDocuments({ status: 'APPROVED' }),
+      AnalyzerConfig.find({}, { name: 1, connection_status: 1, category: 1, updated_at: 1 }).lean(),
+      Reagent.find({ $expr: { $lte: ['$stock', '$threshold'] } }, { name: 1, stock: 1, threshold: 1, expiry: 1 }).lean(),
+      Invoice.aggregate([{ $match: { date: { $gte: dayIso } } }, { $group: { _id: null, total: { $sum: '$amount' } } }]),
+    ]);
+    const connected = analyzers.filter((analyzer) => ['CONNECTED', 'DATA RECEIVED'].includes(analyzer.connection_status)).length;
+    res.json({
+      totalPatients: patients, todaySamples: samples, pendingResults, pendingPathologistReviews: pendingReviews,
+      approvedReports, connectedAnalyzers: connected, disconnectedAnalyzers: analyzers.length - connected,
+      lowStockReagents: lowStock.length, todayRevenue: revenueRows[0]?.total || 0, analyzers, lowStock,
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post('/api/results/add', allowRoles('admin', 'technician', 'pathologist'), async (req, res) => {
   try {
     const { patientId, testName, resultValue, unit, referenceRange, machineName, status } = req.body;
     const now = new Date().toISOString();
@@ -801,13 +1061,12 @@ app.post('/api/results/add', async (req, res) => {
       unit: unit || '',
       reference_range: referenceRange || '',
       machine_name: machineName || '',
-      status: status || 'completed',
+      status: status || 'VALIDATION_PENDING',
       date: now,
       raw_data: 'manual-entry',
     });
 
-    await Patient.findOneAndUpdate({ id: patientId }, { status: 'completed' });
-    await logAudit('result_added', patientId, 'technician', `${testName} result recorded`);
+    await logAudit('result_added', patientId, req.user.id, `${testName} result recorded`, { req, entity: 'Result' });
     emitUpdate('result-created', result);
     res.json({ id: result._id, message: 'Result recorded successfully' });
   } catch (err) {
@@ -815,7 +1074,7 @@ app.post('/api/results/add', async (req, res) => {
   }
 });
 
-app.post('/api/results/update', async (req, res) => {
+app.post('/api/results/update', allowRoles('admin', 'technician', 'pathologist'), async (req, res) => {
   try {
     const { id, resultValue, unit, referenceRange, status } = req.body;
     if (!id) {
@@ -828,12 +1087,14 @@ app.post('/api/results/update', async (req, res) => {
     if (referenceRange !== undefined) updateFields.reference_range = referenceRange;
     if (status !== undefined) updateFields.status = status;
 
+    const oldResult = await Result.findById(id);
+    if (oldResult?.status === 'APPROVED') return res.status(409).json({ error: 'An approved result cannot be overwritten. Create a report revision instead.' });
     const result = await Result.findByIdAndUpdate(id, updateFields, { new: true });
     if (!result) {
       return res.status(404).json({ error: 'Result not found' });
     }
 
-    await logAudit('result_updated', id, 'technician', 'Result value updated manually');
+    await logAudit('result_updated', id, req.user.id, 'Result value updated manually', { req, entity: 'Result', oldValue: oldResult?.toObject(), newValue: result.toObject() });
     emitUpdate('result-created', result);
     const resultObject = result.toObject();
     res.json({ ...resultObject, id: resultObject._id });
@@ -904,11 +1165,33 @@ app.get('/api/reagents', async (req, res) => {
   }
 });
 
-app.post('/api/reagents/update', async (req, res) => {
+app.post('/api/reagents', allowRoles('admin'), async (req, res) => {
   try {
-    const { id, stock } = req.body;
-    await Reagent.findByIdAndUpdate(id, { stock });
-    res.json({ message: 'Reagent stock updated' });
+    const input = req.body || {};
+    if (!String(input.name || '').trim() || !Number.isFinite(Number(input.stock))) return res.status(400).json({ error: 'Reagent name and numeric stock are required.' });
+    if (input.analyzerId && !await AnalyzerConfig.findById(input.analyzerId)) return res.status(404).json({ error: 'Mapped analyzer not found.' });
+    const reagent = await Reagent.create({
+      name: input.name.trim(), manufacturer: input.manufacturer || '', lot_number: input.lotNumber || '',
+      stock: Number(input.stock), unit: input.unit || '', expiry: input.expiry || '', threshold: Number(input.minimumStock ?? input.threshold) || 0,
+      machine: input.machine || '', analyzer_id: input.analyzerId || undefined, storage_location: input.storageLocation || '', status: input.status || 'ACTIVE',
+    });
+    await logAudit('reagent_created', String(reagent._id), req.user.id, `Created ${reagent.name}`, { req, entity: 'Reagent', newValue: reagent.toObject() });
+    res.status(201).json(reagent);
+  } catch (error) {
+    res.status(error?.code === 11000 ? 409 : 500).json({ error: error?.code === 11000 ? 'A reagent with this name already exists.' : error.message });
+  }
+});
+
+app.post('/api/reagents/update', allowRoles('admin'), async (req, res) => {
+  try {
+    const { id, stock, reason = '' } = req.body;
+    if (!id || !Number.isFinite(Number(stock))) return res.status(400).json({ error: 'Reagent ID and numeric stock are required.' });
+    const before = await Reagent.findById(id);
+    if (!before) return res.status(404).json({ error: 'Reagent not found.' });
+    const usage = { at: new Date().toISOString(), user_id: req.user.id, previous_stock: before.stock, new_stock: Number(stock), reason: String(reason) };
+    const reagent = await Reagent.findByIdAndUpdate(id, { stock: Number(stock), $push: { usage_history: usage } }, { new: true });
+    await logAudit('reagent_stock_updated', id, req.user.id, `${before.name}: ${before.stock} → ${stock}`, { req, entity: 'Reagent', oldValue: before.toObject(), newValue: reagent.toObject() });
+    res.json({ reagent, lowStock: reagent.stock <= reagent.threshold, message: 'Reagent stock updated' });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -938,6 +1221,7 @@ app.get('/api/reports', async (req, res) => {
           distributed_at: 1,
           findings: 1,
           doctor_notes: 1,
+          machine_parameters: 1,
           patient_name: '$patient.name',
           patient_phone: '$patient.phone',
         },
@@ -986,7 +1270,7 @@ app.get('/api/billing/payment-qr', async (req, res) => {
   }
 });
 
-app.post('/api/billing/payment-qr', async (req, res) => {
+app.post('/api/billing/payment-qr', allowRoles('admin'), async (req, res) => {
   try {
     const { paymentQr } = req.body || {};
     if (!paymentQr || !/^data:image\/(png|jpeg|jpg|webp);base64,/.test(paymentQr)) {
@@ -1006,73 +1290,303 @@ app.post('/api/billing/payment-qr', async (req, res) => {
   }
 });
 
-app.post('/api/reports/generate', async (req, res) => {
+const drawReportPdf = (document, { report, patient, results }) => {
+  document.fontSize(20).fillColor('#123c69').text(process.env.LAB_NAME || 'Smart Lab Diagnostic Centre');
+  document.fontSize(9).fillColor('#444').text(process.env.LAB_ADDRESS || 'Laboratory information system report');
+  document.moveDown();
+  document.fontSize(14).fillColor('#111').text(`Laboratory report · ${report.id}`);
+  document.fontSize(10).text(`Status: ${report.status}    Revision: ${report.revision || 1}`);
+  document.moveDown(0.6);
+  document.fontSize(11).text(`Patient: ${patient?.name || 'Unknown'} (${report.patient_id})`);
+  document.text(`Age / Sex: ${patient?.age ?? '-'} / ${patient?.gender || '-'}`);
+  document.text(`Referring doctor: ${patient?.doctor || '-'}`);
+  document.text(`Generated: ${report.generated_at ? new Date(report.generated_at).toLocaleString() : '-'}`);
+  document.moveDown();
+  document.fontSize(11).fillColor('#123c69').text('Results');
+  document.moveDown(0.3);
+  document.fontSize(8).fillColor('#111');
+  const rows = results.length ? results : (report.machine_parameters || []).filter((row) => !row.isSubheading).map((row) => ({
+    test_name: row.name, result_value: row.value, unit: row.unit, reference_range: row.range, status: row.status,
+  }));
+  for (const row of rows) {
+    document.text(`${row.test_name || row.test_code || 'Test'}     ${row.result_value ?? '-'} ${row.unit || ''}     Ref: ${row.reference_range || '-'}     ${row.status || ''}`);
+  }
+  document.moveDown();
+  if (report.findings) document.text(`Findings: ${report.findings}`);
+  if (report.doctor_notes) document.text(`Comments: ${report.doctor_notes}`);
+  document.moveDown();
+  if (report.approval?.pathologist_name) {
+    document.fillColor('#123c69').text(`Approved by: ${report.approval.pathologist_name}`);
+    document.fillColor('#111').text(`Approval recorded: ${new Date(report.approval.signed_at).toLocaleString()}`);
+  } else {
+    document.fillColor('#9b1c1c').text('Not approved — not for clinical release.');
+  }
+  document.moveDown();
+  document.fontSize(7).fillColor('#555').text('This LIS records analyzer output and professional review. It does not perform autonomous diagnosis.');
+};
+
+const reportData = async (id) => {
+  const report = await Report.findOne({ id }).lean();
+  if (!report) return null;
+  const [patient, results] = await Promise.all([
+    Patient.findOne({ id: report.patient_id }).lean(),
+    Result.find({ patient_id: report.patient_id }).sort({ date: -1 }).lean(),
+  ]);
+  return { report, patient, results };
+};
+
+const reportPdfBuffer = (data) => new Promise((resolve, reject) => {
+  const document = new PDFDocument({ margin: 42, size: 'A4' });
+  const buffers = [];
+  document.on('data', (chunk) => buffers.push(chunk));
+  document.on('end', () => resolve(Buffer.concat(buffers)));
+  document.on('error', reject);
+  drawReportPdf(document, data);
+  document.end();
+});
+
+app.post('/api/reports/generate', allowRoles('admin', 'technician', 'pathologist'), async (req, res) => {
   try {
-    const { patientId, reportType, findings, doctorNotes } = req.body;
+    const { patientId, reportType, findings, doctorNotes, machineParameters, sourceAnalyzerResultId } = req.body;
     const reportId = `REP-${Date.now()}`;
     const now = new Date().toISOString();
+    const patient = await Patient.findOne({ id: patientId }).lean();
+    if (!patient) return res.status(404).json({ error: 'Patient not found.' });
     await Report.create({
       id: reportId,
       patient_id: patientId,
       report_type: reportType,
-      status: 'Generated',
+      status: 'DRAFT',
       generated_at: now,
       findings,
       doctor_notes: doctorNotes,
+      ...(Array.isArray(machineParameters) ? { machine_parameters: machineParameters } : {}),
+      ...(sourceAnalyzerResultId ? { source_analyzer_result_id: sourceAnalyzerResultId } : {}),
     });
-    res.json({ id: reportId, message: 'Report generated successfully' });
+    await logAudit('report_created', reportId, req.user.id, 'Draft report created.', { req, entity: 'Report' });
+    res.status(201).json({ id: reportId, status: 'DRAFT', message: 'Draft report created. Pathologist approval is required before release.' });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
-app.post('/api/reports/update', async (req, res) => {
+app.post('/api/reports/update', allowRoles('admin', 'technician', 'pathologist'), async (req, res) => {
   try {
-    const { id, findings, doctorNotes, reportType } = req.body;
+    const { id, findings, doctorNotes, reportType, machineParameters, sourceAnalyzerResultId } = req.body;
     if (!id) {
       return res.status(400).json({ error: 'Report id is required' });
     }
 
+    const existing = await Report.findOne({ id });
+    if (!existing) return res.status(404).json({ error: 'Report not found' });
+    if (existing.status === 'APPROVED') return res.status(409).json({ error: 'Approved reports cannot be overwritten. Create a revision.' });
     const update = {};
     if (findings !== undefined) update.findings = findings;
     if (doctorNotes !== undefined) update.doctor_notes = doctorNotes;
     if (reportType) update.report_type = reportType;
+    if (machineParameters !== undefined) update.machine_parameters = machineParameters;
+    if (sourceAnalyzerResultId) update.source_analyzer_result_id = sourceAnalyzerResultId;
 
     const report = await Report.findOneAndUpdate({ id }, update, { new: true });
-    if (!report) {
-      return res.status(404).json({ error: 'Report not found' });
+
+    const analyzerResultId = sourceAnalyzerResultId || report.source_analyzer_result_id;
+    if (analyzerResultId && Array.isArray(machineParameters)) {
+      const analyzerResult = await AnalyzerResult.findById(analyzerResultId);
+      if (!analyzerResult) {
+        return res.status(404).json({ error: 'Source analyzer result not found' });
+      }
+
+      const reviewedParameters = { ...(analyzerResult.reviewed_parameters || {}) };
+      for (const parameter of machineParameters) {
+        if (parameter?.isSubheading) continue;
+        const parameterCode = parameter.sourceParameterCode || parameter.code;
+        if (!parameterCode) continue;
+
+        const original = analyzerResult.parameters?.[parameterCode] || {};
+        reviewedParameters[parameterCode] = {
+          ...original,
+          testName: parameter.name || original.testName || parameterCode,
+          value: parameter.value ?? '',
+          unit: parameter.unit ?? original.unit ?? '',
+          referenceRange: parameter.range ?? original.referenceRange ?? '',
+          abnormalFlag: parameter.status === 'High' ? 'H' : parameter.status === 'Low' ? 'L' : '',
+        };
+      }
+      await AnalyzerResult.findByIdAndUpdate(analyzerResultId, { reviewed_parameters: reviewedParameters });
     }
 
-    await logAudit('report_updated', id, 'technician', 'Report manually edited by user');
+    await logAudit('report_updated', id, req.user.id, 'Report manually edited by user', { req, entity: 'Report', oldValue: existing.toObject(), newValue: update });
     res.json(report);
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
-app.post('/api/reports/verify', async (req, res) => {
+app.post('/api/reports/verify', allowRoles('admin', 'pathologist'), async (req, res) => {
   try {
     const { id } = req.body;
-    await Report.findOneAndUpdate({ id }, { status: 'Verified', verified_at: new Date().toISOString() });
-    await logAudit('report_verified', id, 'technician', 'Report verified by user');
-    res.json({ message: 'Report verified' });
+    const report = await Report.findOne({ id });
+    if (!report) return res.status(404).json({ error: 'Report not found.' });
+    if (report.status === 'APPROVED') return res.status(409).json({ error: 'Report is already approved.' });
+    const signedAt = new Date().toISOString();
+    report.status = 'APPROVED';
+    report.verified_at = signedAt;
+    report.approval = {
+      pathologist_id: req.user.id,
+      pathologist_name: req.user.name,
+      signed_at: signedAt,
+      comment: String(req.body?.comment || ''),
+    };
+    await report.save();
+    await logAudit('report_approved', id, req.user.id, 'Report approved by pathologist.', { req, entity: 'Report', newValue: report.approval });
+    res.json({ message: 'Report approved. The PDF records the approving pathologist and timestamp.', report });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
-app.post('/api/reports/distribute', async (req, res) => {
+app.post('/api/reports/:id/revise', allowRoles('admin', 'pathologist'), async (req, res) => {
   try {
-    const { id } = req.body;
-    await Report.findOneAndUpdate({ id }, { status: 'Distributed', distributed_at: new Date().toISOString() });
-    await logAudit('report_distributed', id, 'technician', 'Report distributed to patient');
-    res.json({ message: 'Report distributed' });
+    const original = await Report.findOne({ id: req.params.id });
+    const reason = String(req.body?.reason || '').trim();
+    if (!original) return res.status(404).json({ error: 'Report not found.' });
+    if (!reason) return res.status(400).json({ error: 'A revision reason is required.' });
+    if (original.status !== 'APPROVED') return res.status(409).json({ error: 'Only an approved report can be revised.' });
+    const revision = await Report.create({
+      id: `REP-${Date.now()}`,
+      patient_id: original.patient_id,
+      report_type: req.body?.reportType || original.report_type,
+      status: 'REVISED',
+      generated_at: new Date().toISOString(),
+      findings: req.body?.findings ?? original.findings,
+      doctor_notes: `${original.doctor_notes || ''}${original.doctor_notes ? '\n' : ''}Revision reason: ${reason}`,
+      machine_parameters: req.body?.machineParameters ?? original.machine_parameters,
+      source_analyzer_result_id: original.source_analyzer_result_id,
+      revision: (original.revision || 1) + 1,
+      previous_report_id: original.id,
+    });
+    await logAudit('report_revised', revision.id, req.user.id, `Revision created from ${original.id}: ${reason}`, { req, entity: 'Report', oldValue: original.toObject(), newValue: revision.toObject() });
+    res.status(201).json(revision);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.get('/api/reports/:id/pdf', async (req, res) => {
+  try {
+    const data = await reportData(req.params.id);
+    if (!data) return res.status(404).json({ error: 'Report not found.' });
+    res.setHeader('Content-Type', 'application/pdf');
+    res.setHeader('Content-Disposition', `attachment; filename="${data.report.id}.pdf"`);
+    const document = new PDFDocument({ margin: 42, size: 'A4' });
+    document.on('error', (error) => { if (!res.headersSent) res.status(500).json({ error: error.message }); });
+    document.pipe(res);
+    drawReportPdf(document, data);
+    document.end();
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post('/api/reports/distribute', allowRoles('admin', 'pathologist'), async (req, res) => {
+  try {
+    const { id, channel = 'EMAIL' } = req.body;
+    if (channel !== 'EMAIL') return res.status(501).json({ error: 'WhatsApp delivery needs a configured provider adapter; no message was sent.' });
+    const data = await reportData(id);
+    if (!data) return res.status(404).json({ error: 'Report not found.' });
+    if (data.report.status !== 'APPROVED') return res.status(409).json({ error: 'Only an approved report may be distributed.' });
+    if (!data.patient?.email) return res.status(400).json({ error: 'Patient email is missing.' });
+    if (!process.env.SMTP_HOST || !process.env.SMTP_USER || !process.env.SMTP_PASSWORD || !process.env.SMTP_FROM) {
+      return res.status(503).json({ error: 'SMTP is not configured; no email was sent.' });
+    }
+    const transporter = nodemailer.createTransport({
+      host: process.env.SMTP_HOST,
+      port: Number(process.env.SMTP_PORT) || 587,
+      secure: process.env.SMTP_SECURE === 'true',
+      auth: { user: process.env.SMTP_USER, pass: process.env.SMTP_PASSWORD },
+    });
+    await transporter.sendMail({
+      from: process.env.SMTP_FROM,
+      to: data.patient.email,
+      subject: `${process.env.LAB_NAME || 'Smart Lab'} report ${data.report.id}`,
+      text: 'Your approved laboratory report is attached. Please contact the laboratory for clinical interpretation.',
+      attachments: [{ filename: `${data.report.id}.pdf`, content: await reportPdfBuffer(data), contentType: 'application/pdf' }],
+    });
+    await Report.findOneAndUpdate({ id }, { distributed_at: new Date().toISOString() });
+    await logAudit('report_emailed', id, req.user.id, `Approved report emailed to ${data.patient.email}`, { req, entity: 'Report' });
+    res.json({ message: 'Approved report sent by email.' });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
-app.get('/api/history', async (req, res) => {
+app.get('/api/history/daily', allowRoles('admin', 'technician', 'pathologist'), async (req, res) => {
+  try {
+    const date = String(req.query.date || '').trim();
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) return res.status(400).json({ error: 'Use date in YYYY-MM-DD format.' });
+
+    // The LIS UI operates in India; calculating the day range explicitly keeps
+    // a late-night patient/report on the clinical day selected in the UI.
+    const start = new Date(`${date}T00:00:00.000+05:30`);
+    const end = new Date(start.getTime() + 24 * 60 * 60 * 1000);
+    const range = { $gte: start.toISOString(), $lt: end.toISOString() };
+    const [registeredPatients, collectedSamples, reports, resultRows] = await Promise.all([
+      Patient.find({ date: range }).lean(),
+      Sample.find({ collection_date: range }).lean(),
+      Report.find({ generated_at: range }).sort({ generated_at: -1 }).lean(),
+      Result.find({ date: range }).sort({ date: -1 }).lean(),
+    ]);
+
+    const patientIds = [...new Set([
+      ...registeredPatients.map((patient) => patient.id),
+      ...collectedSamples.map((sample) => sample.patient_id),
+      ...reports.map((report) => report.patient_id),
+      ...resultRows.map((result) => result.patient_id),
+    ].filter(Boolean))];
+    const patientRows = patientIds.length ? await Patient.find({ id: { $in: patientIds } }).lean() : [];
+    const samplesByPatient = new Map();
+    const reportsByPatient = new Map();
+    const resultsByPatient = new Map();
+    for (const sample of collectedSamples) {
+      const rows = samplesByPatient.get(sample.patient_id) || [];
+      rows.push(sample); samplesByPatient.set(sample.patient_id, rows);
+    }
+    for (const report of reports) {
+      const rows = reportsByPatient.get(report.patient_id) || [];
+      rows.push(report); reportsByPatient.set(report.patient_id, rows);
+    }
+    for (const result of resultRows) {
+      const rows = resultsByPatient.get(result.patient_id) || [];
+      rows.push(result); resultsByPatient.set(result.patient_id, rows);
+    }
+
+    const patients = patientRows
+      .map((patient) => ({
+        ...patient,
+        registeredToday: registeredPatients.some((row) => row.id === patient.id),
+        samples: samplesByPatient.get(patient.id) || [],
+        reports: reportsByPatient.get(patient.id) || [],
+        results: resultsByPatient.get(patient.id) || [],
+      }))
+      .sort((left, right) => new Date(right.date || 0) - new Date(left.date || 0));
+
+    res.json({
+      date,
+      summary: {
+        patientsRegistered: registeredPatients.length,
+        samplesCollected: collectedSamples.length,
+        resultsReceived: resultRows.length,
+        reportsGenerated: reports.length,
+        reportsApproved: reports.filter((report) => report.status === 'APPROVED').length,
+      },
+      patients,
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.get('/api/history', allowRoles('admin'), async (req, res) => {
   try {
     const rows = await AuditLog.find().sort({ timestamp: -1 }).limit(50);
     res.json(rows);
@@ -1081,7 +1595,7 @@ app.get('/api/history', async (req, res) => {
   }
 });
 
-app.get('/api/billing', async (req, res) => {
+app.get('/api/billing', allowRoles('admin'), async (req, res) => {
   try {
     const rows = await Invoice.aggregate([
       { $sort: { date: -1 } },
@@ -1114,7 +1628,7 @@ app.get('/api/billing', async (req, res) => {
   }
 });
 
-app.post('/api/billing/create', async (req, res) => {
+app.post('/api/billing/create', allowRoles('admin'), async (req, res) => {
   try {
     const { patientId, amount, items, discount, status, paymentMethod } = req.body;
     if (!patientId || !items || !Number.isFinite(Number(amount))) {
@@ -1166,13 +1680,8 @@ app.get('*', (req, res, next) => {
 
 const PORT = process.env.PORT || 5000;
 
-startCippointTcpServer({ onData: handleCippointData, onStatus: handleCippointStatus });
-
 connectDB()
-  .then(async () => {
-    console.log('MongoDB connected');
-    await ensureCippointConfiguration();
-  })
+  .then(() => console.log('MongoDB connected'))
   .catch((err) => console.error('MongoDB connection failed:', err?.message || err));
 
 httpServer.listen(PORT, () => {

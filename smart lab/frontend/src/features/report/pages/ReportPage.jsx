@@ -16,15 +16,66 @@ const getVal = (results, keywords) => {
 
 const getStat = (results, keywords, val, min, max) => {
   const r = findResult(results, keywords);
-  if (r && r.status) return r.status;
   const n = parseFloat(val);
   if (!isNaN(n)) {
     if (n < min) return "Low";
     if (n > max) return "High";
     return "Normal";
   }
-  return "Normal";
+  return r?.status || "Normal";
 };
+
+const getResultStatus = (value, range, fallbackStatus, gender) => {
+  const numericValue = Number.parseFloat(String(value ?? "").replace(/,/g, ""));
+  const status = String(fallbackStatus || "").trim().toLowerCase();
+  const abnormalStatus = status === "h" || status.includes("high") || status.includes("above")
+    ? "High"
+    : status === "l" || status.includes("low") || status.includes("below")
+      ? "Low"
+      : status.includes("abnormal") || status.includes("critical")
+        ? "Abnormal"
+        : "Normal";
+
+  if (!String(value ?? "").trim()) return "Normal";
+  if (!Number.isFinite(numericValue)) return abnormalStatus;
+
+  let rangeText = String(range || "");
+  const selectedGender = String(gender || "").toLowerCase();
+  const genderRanges = [...rangeText.matchAll(/\b(male|female)\s*:\s*([\s\S]*?)(?=\b(?:male|female)\s*:|$)/gi)];
+  if (genderRanges.length) {
+    const preferred = selectedGender.startsWith("f")
+      ? genderRanges.find((match) => match[1].toLowerCase() === "female")
+      : selectedGender.startsWith("m")
+        ? genderRanges.find((match) => match[1].toLowerCase() === "male")
+        : null;
+    if (!preferred) return abnormalStatus;
+    rangeText = preferred[2];
+  }
+
+  const oneSidedRange = rangeText.match(/(<=|>=|<|>|≤|≥)\s*(-?\d+(?:\.\d+)?)/);
+  if (oneSidedRange) {
+    const bound = Number(oneSidedRange[2]);
+    if (oneSidedRange[1] === ">" || oneSidedRange[1] === "≥" || oneSidedRange[1] === ">=") {
+      return numericValue < bound ? "Low" : "Normal";
+    }
+    return numericValue > bound ? "High" : "Normal";
+  }
+
+  const interval = rangeText.match(/(-?\d+(?:\.\d+)?)\s*(?:-|–|to)\s*(-?\d+(?:\.\d+)?)/i);
+  const bounds = interval
+    ? [Number(interval[1]), Number(interval[2])]
+    : rangeText.match(/\d+(?:\.\d+)?/g)?.map(Number);
+  if (bounds?.length >= 2) {
+    if (numericValue < bounds[0]) return "Low";
+    if (numericValue > bounds[1]) return "High";
+    return "Normal";
+  }
+
+  return abnormalStatus;
+};
+
+const getParameterKey = (parameter, index) =>
+  parameter.resultId || parameter.code || `${parameter.name}-${index}`;
 
 const fillHaemogramParameters = (existingResults) => {
   // Map all machine result values — no hardcoded defaults
@@ -109,6 +160,8 @@ const ReportPage = () => {
   const [findings, setFindings] = useState('');
   const [doctorNotes, setDoctorNotes] = useState('');
   const [editedResults, setEditedResults] = useState({});
+  const [editedParameterValues, setEditedParameterValues] = useState({});
+  const [savedMachineParameters, setSavedMachineParameters] = useState(null);
   const [saving, setSaving] = useState(false);
   const [generatedReportId, setGeneratedReportId] = useState(null);
 
@@ -134,6 +187,14 @@ const ReportPage = () => {
         const filteredResults = results.filter(r => r.patient_id === report.patient_id);
         setPatientResults(filteredResults);
         setEditedResults(filteredResults.reduce((acc, item) => ({ ...acc, [item.id]: item.result_value }), {}));
+        setEditedParameterValues({});
+        setSavedMachineParameters(
+          Array.isArray(report.machineParameters)
+            ? report.machineParameters
+            : Array.isArray(report.machine_parameters)
+              ? report.machine_parameters
+              : null
+        );
         setFindings(report.findings || report.findings || '');
         setDoctorNotes(report.doctor_notes || report.doctorNotes || '');
         setGeneratedReportId(report.id || null);
@@ -178,18 +239,37 @@ const ReportPage = () => {
 
     setSaving(true);
     try {
+      const updatedParameters = parameters.map((parameter, index) => {
+        const value = editedParameterValues[getParameterKey(parameter, index)]
+          ?? (parameter.resultId && editedResults[parameter.resultId] !== undefined
+            ? editedResults[parameter.resultId]
+            : parameter.value);
+        const status = getResultStatus(value, parameter.range, parameter.status, patientDetails?.gender);
+        return { ...parameter, value, status };
+      });
       const changedResults = patientResults.filter((item) => editedResults[item.id] !== undefined && editedResults[item.id] !== item.result_value);
-      await Promise.all(changedResults.map((item) => updateResult({ id: item.id, resultValue: editedResults[item.id] })));
+      await Promise.all(changedResults.map((item) => {
+        const parameter = updatedParameters.find((row) => String(row.resultId) === String(item.id));
+        return updateResult({
+          id: item.id,
+          resultValue: editedResults[item.id],
+          ...(parameter ? { status: parameter.status } : {}),
+        });
+      }));
       await updateReport({
         id: reportId,
         findings,
         doctorNotes,
+        machineParameters: updatedParameters,
+        sourceAnalyzerResultId: report.sourceAnalyzerResultId || report.source_analyzer_result_id,
       });
 
       const freshResults = await getResults();
       const filteredResults = freshResults.filter((item) => item.patient_id === report.patient_id);
       setPatientResults(filteredResults);
       setEditedResults(filteredResults.reduce((acc, item) => ({ ...acc, [item.id]: item.result_value }), {}));
+      setEditedParameterValues({});
+      setSavedMachineParameters(updatedParameters);
       setGeneratedReportId(reportId);
       setEditMode(false);
       alert('Report saved successfully.');
@@ -206,6 +286,7 @@ const ReportPage = () => {
     setFindings(report.findings || report.findings || '');
     setDoctorNotes(report.doctor_notes || report.doctorNotes || '');
     setEditedResults(patientResults.reduce((acc, item) => ({ ...acc, [item.id]: item.result_value }), {}));
+    setEditedParameterValues({});
   };
 
   const handleEmailShare = () => {
@@ -235,14 +316,22 @@ const ReportPage = () => {
   const testTitle = getTestTitle(testType);
   const isCbc = testTitle === "HAEMOGRAM";
 
-  const parameters = isCbc ? fillHaemogramParameters(patientResults) : patientResults.map(r => ({
-    name: r.test_name.toUpperCase(),
-    value: editedResults[r.id] !== undefined ? editedResults[r.id] : r.result_value,
-    resultId: r.id,
-    unit: r.unit || "",
-    range: r.reference_range || "Normal",
-    status: r.status || "Normal"
-  }));
+  const parameters = Array.isArray(savedMachineParameters)
+    ? savedMachineParameters.map((parameter) => ({
+      ...parameter,
+      value: parameter.value ?? "",
+      unit: parameter.unit || "",
+      range: parameter.range || "",
+      status: parameter.status || "Normal",
+    }))
+    : isCbc ? fillHaemogramParameters(patientResults) : patientResults.map(r => ({
+      name: r.test_name.toUpperCase(),
+      value: r.result_value,
+      resultId: r.id,
+      unit: r.unit || "",
+      range: r.reference_range || "Normal",
+      status: r.status || "Normal"
+    }));
 
   return (
     <div className="min-h-screen bg-slate-100 py-10 px-4 flex flex-col items-center">
@@ -304,15 +393,31 @@ const ReportPage = () => {
           <div className="space-y-1.5">
             {loading ? <div className="text-center py-10 font-semibold text-slate-500">Loading...</div> : parameters.map((p, i) => {
               if (p.isSubheading) return <div key={i} className="pt-2 pb-0.5 border-b border-slate-200"><span className="text-[11px] font-extrabold text-slate-900 underline tracking-wider">{p.name}</span></div>;
-              if (p.isSmear) return <div key={i} className="grid grid-cols-[2.5fr_0.2fr_5fr] text-[11px] py-0.5 text-slate-800 font-medium"><div className="font-bold text-slate-700">{p.name}</div><div className="text-center text-slate-400">:</div><div className="font-bold text-slate-900">{p.value}</div></div>;
-              const isRed = p.status === "Low" || p.status === "High";
-              const editableValue = editedResults[p.resultId] !== undefined ? editedResults[p.resultId] : p.value;
-              return <div key={i} className="grid grid-cols-[2.5fr_0.2fr_1.2fr_1.2fr_2.5fr] text-[11px] py-0.5 text-slate-800 font-medium items-baseline"><div className="font-bold text-slate-700">{p.name}</div><div className="text-center text-slate-400">:</div><div className={`font-extrabold ${isRed ? "text-red-600" : "text-slate-900"}`}>{editMode && p.resultId ? <input
+              const editableValue = editedParameterValues[getParameterKey(p, i)]
+                ?? (p.resultId && editedResults[p.resultId] !== undefined ? editedResults[p.resultId] : p.value);
+              const currentStatus = getResultStatus(editableValue, p.range, p.status, patientDetails?.gender);
+              const isRed = currentStatus !== "Normal";
+              const valueClassName = `font-extrabold ${isRed ? "text-red-600" : "text-black"}`;
+              if (p.isSmear) return <div key={i} className="grid grid-cols-[2.5fr_0.2fr_5fr] text-[11px] py-0.5 text-slate-800 font-medium"><div className="font-bold text-slate-700">{p.name}</div><div className="text-center text-slate-400">:</div><div className={valueClassName}>{editMode ? <input
                 type="text"
                 value={editableValue}
-                onChange={(e) => setEditedResults((prev) => ({ ...prev, [p.resultId]: e.target.value }))}
-                className="w-full bg-white border border-slate-300 rounded-md px-2 py-1 text-sm text-slate-900"
-              /> : p.value}</div><div className="text-slate-500 font-semibold">{p.unit}</div><div className="text-right text-slate-500 text-[10px] font-semibold">{p.range}</div></div>;
+                onChange={(e) => {
+                  const value = e.target.value;
+                  setEditedParameterValues((prev) => ({ ...prev, [getParameterKey(p, i)]: value }));
+                  if (p.resultId) setEditedResults((prev) => ({ ...prev, [p.resultId]: value }));
+                }}
+                className={`w-full bg-white border border-slate-300 rounded-md px-2 py-1 text-sm ${isRed ? "text-red-600" : "text-black"}`}
+              /> : editableValue}</div></div>;
+              return <div key={i} className="grid grid-cols-[2.5fr_0.2fr_1.2fr_1.2fr_2.5fr] text-[11px] py-0.5 text-slate-800 font-medium items-baseline"><div className="font-bold text-slate-700">{p.name}</div><div className="text-center text-slate-400">:</div><div className={valueClassName}>{editMode ? <input
+                type="text"
+                value={editableValue}
+                onChange={(e) => {
+                  const value = e.target.value;
+                  setEditedParameterValues((prev) => ({ ...prev, [getParameterKey(p, i)]: value }));
+                  if (p.resultId) setEditedResults((prev) => ({ ...prev, [p.resultId]: value }));
+                }}
+                className={`w-full bg-white border border-slate-300 rounded-md px-2 py-1 text-sm ${isRed ? "text-red-600" : "text-black"}`}
+              /> : editableValue}</div><div className="text-slate-500 font-semibold">{p.unit}</div><div className="text-right text-slate-500 text-[10px] font-semibold">{p.range}</div></div>;
             })}
           </div>
         </div>

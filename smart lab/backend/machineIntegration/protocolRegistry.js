@@ -1,6 +1,8 @@
 import { createProtocolAdapter } from './protocolAdapter.js';
 import { parseHl7Message } from './parsers/hl7Parser.js';
 import { parseGp11Message } from './parsers/gp11Parser.js';
+import { parseAstmMessage } from './parsers/astmParser.js';
+import { parseCustomJsonMessage } from './parsers/customJsonParser.js';
 
 const adapters = new Map();
 
@@ -11,5 +13,7 @@ export const registerProtocolAdapter = (protocol, parser) => {
 export const getProtocolAdapter = (protocol) => adapters.get(protocol) || createProtocolAdapter({ protocol });
 
 registerProtocolAdapter('HL7', parseHl7Message);
+registerProtocolAdapter('ASTM', parseAstmMessage);
+registerProtocolAdapter('CUSTOM', parseCustomJsonMessage);
 registerProtocolAdapter('GP11', parseGp11Message);
 registerProtocolAdapter('MANUFACTURER_SPECIFIC', parseGp11Message);

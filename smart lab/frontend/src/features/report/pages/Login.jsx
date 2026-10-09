@@ -1,6 +1,7 @@
 import React, { useState } from "react";
-import { useNavigate, Link } from "react-router-dom";
+import { useNavigate } from "react-router-dom";
 import { loginUser } from "../services/api";
+import socket from '../../../app/socket';
 
 const Login = () => {
   const [username, setUsername] = useState("");
@@ -24,6 +25,7 @@ const Login = () => {
         "activeUser",
         user.username || user.name || username
       );
+      socket.connect();
 
       // React Router navigation - prevents Vercel 404
       navigate("/home");
@@ -122,16 +124,7 @@ const Login = () => {
           </button>
         </form>
 
-        {/* Register */}
-        <p className="text-center text-sm text-gray-600 mt-6">
-          New Pathologist?{" "}
-          <Link
-            to="/register"
-            className="text-blue-600 font-semibold hover:underline"
-          >
-            Register here
-          </Link>
-        </p>
+        <p className="text-center text-sm text-gray-600 mt-6">New personnel accounts are provisioned by a laboratory administrator.</p>
 
         {/* Public product description */}
         <div className="mt-6 text-xs text-gray-500 bg-gray-100 p-3 rounded-lg text-center">
