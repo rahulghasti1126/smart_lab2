@@ -9,9 +9,6 @@ import { Server } from 'socket.io';
 import { SerialPort } from 'serialport';
 import { ReadlineParser } from '@serialport/parser-readline';
 import net from 'net';
-import path from 'path';
-import { fileURLToPath } from 'url';
-import { dirname } from 'path';
 import crypto from 'crypto';
 import jwt from 'jsonwebtoken';
 import authRoutes from './routes/authRoutes.js';
@@ -24,11 +21,11 @@ import { validateAnalyzerConfig } from './machineIntegration/validation.js';
 import { AnalyzerConnectionManager } from './machineIntegration/communication/connectionManager.js';
 import { protect, allowRoles } from './middleware/auth.js';
 
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = dirname(__filename);
-
 const app = express();
-const allowedOrigins = process.env.CORS_ORIGINS?.split(',').map((origin) => origin.trim()).filter(Boolean) || ['http://localhost:5173'];
+const defaultAllowedOrigins = ['http://localhost:5173', 'https://smartlab2-frontend.vercel.app'];
+const allowedOrigins = process.env.CORS_ORIGINS
+  ? process.env.CORS_ORIGINS.split(',').map((origin) => origin.trim()).filter(Boolean)
+  : defaultAllowedOrigins;
 app.use(helmet({ crossOriginResourcePolicy: false }));
 app.use(cors({
   origin(origin, callback) {
@@ -37,6 +34,14 @@ app.use(cors({
   },
 }));
 app.use(express.json({ limit: '6mb' }));
+
+app.get('/api/health', (req, res) => {
+  res.json({ status: 'ok', database: 'connected' });
+});
+
+app.get('/api', (req, res) => {
+  res.json({ status: 'ok', message: 'Smart Lab API is available' });
+});
 
 app.use('/api/auth', rateLimit({ windowMs: 15 * 60 * 1000, max: 20, standardHeaders: true, legacyHeaders: false }));
 app.use('/api/auth', authRoutes);
@@ -1658,35 +1663,19 @@ app.post('/api/billing/create', allowRoles('admin'), async (req, res) => {
   }
 });
 
-app.get('/api', (req, res) => {
-  res.json({ status: 'ok', message: 'Smart Lab API is available' });
-});
-
-app.all('/api/*', (req, res) => {
+app.use('/api', (req, res) => {
   res.status(404).json({ error: 'API route not found', path: req.path });
 });
 
-// Serve frontend static files
-const distPath = path.resolve(__dirname, '../frontend/dist');
-app.use(express.static(distPath));
-
-// Fallback all client-side navigation requests to index.html
-app.get('*', (req, res, next) => {
-  if (req.path.startsWith('/api') || req.path.startsWith('/socket.io')) {
-    return next();
-  }
-  res.sendFile(path.join(distPath, 'index.html'));
+app.use((error, req, res, next) => {
+  if (res.headersSent) return next(error);
+  console.error('Request failed:', error.message || error);
+  const status = error.status || 500;
+  res.status(status).json({ error: status >= 500 ? 'Internal server error.' : error.message });
 });
 
-const PORT = process.env.PORT || 5000;
-
-connectDB()
-  .then(() => console.log('MongoDB connected'))
-  .catch((err) => console.error('MongoDB connection failed:', err?.message || err));
-
-httpServer.listen(PORT, () => {
-  console.log(`LIS Middleware running on http://localhost:${PORT}`);
-});
+const PORT = Number.parseInt(process.env.PORT || '5000', 10);
+const HOST = '0.0.0.0';
 
 httpServer.on('error', (err) => {
   console.error('Server failed to start:', err.message);
@@ -1695,3 +1684,21 @@ httpServer.on('error', (err) => {
   }
   process.exit(1);
 });
+
+const startServer = async () => {
+  try {
+    if (!process.env.JWT_SECRET || (process.env.NODE_ENV === 'production' && process.env.JWT_SECRET.length < 32)) {
+      throw new Error('JWT_SECRET must be configured with at least 32 characters in production.');
+    }
+
+    await connectDB();
+    httpServer.listen(PORT, HOST, () => {
+      console.log(`Smart Lab API listening on ${HOST}:${PORT}`);
+    });
+  } catch (error) {
+    console.error('Server startup failed; HTTP server was not started:', error.message || error);
+    process.exit(1);
+  }
+};
+
+startServer();
