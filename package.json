@@ -10,9 +10,17 @@
     "build": "npm run build:frontend",
     "start": "npm run start --prefix \"smart lab/backend\"",
     "start:gateway": "npm run gateway --prefix \"smart lab/backend\"",
-    "dev": "concurrently \"npm run dev:backend\" \"npm run dev:frontend\""
+    "dev": "concurrently \"npm run dev:backend\" \"npm run dev:frontend\"",
+    "electron": "electron \"smart lab/backend\"",
+    "dev:desktop": "concurrently -k -s first \"npm run dev:backend\" \"npm run dev:frontend\" \"wait-on tcp:127.0.0.1:5000 http://127.0.0.1:5173 && npm run electron\"",
+    "rebuild:electron": "electron-builder install-app-deps --config electron-builder.config.cjs",
+    "pack:win": "npm run build:frontend && electron-builder --config electron-builder.config.cjs --win --dir",
+    "dist:win": "npm run build:frontend && electron-builder --config electron-builder.config.cjs --win nsis"
   },
   "devDependencies": {
-    "concurrently": "^8.2.2"
+    "concurrently": "^8.2.2",
+    "electron": "^44.7.0",
+    "electron-builder": "^26.15.3",
+    "wait-on": "^8.0.3"
   }
 }
