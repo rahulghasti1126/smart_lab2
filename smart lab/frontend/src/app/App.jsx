@@ -1,4 +1,4 @@
-import React, { useEffect } from 'react';
+import { useEffect } from 'react';
 import { BrowserRouter, Routes, Route, Navigate, useLocation } from 'react-router-dom';
 import Login from '../features/report/pages/Login';
 import Register from '../features/report/pages/Register';
@@ -44,7 +44,8 @@ function App() {
       <RouteIndexing />
       <Routes>
         <Route path="/" element={<Login />} />
-        <Route path="/register" element={<PrivateRoute><Register /></PrivateRoute>} />
+        <Route path="/login" element={<Login />} />
+        <Route path="/register" element={<Register />} />
         <Route path="/home" element={
           <PrivateRoute>
             <Home />
