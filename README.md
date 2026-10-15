@@ -31,6 +31,12 @@ Smart Lab is a modular, offline-first laboratory information system (LIS) for pa
 
 To create the first admin safely, set `ADMIN_INITIAL_PASSWORD` and optionally `ADMIN_INITIAL_USERNAME` before the first backend start. Remove `ADMIN_INITIAL_PASSWORD` after account creation. There are no hard-coded live credentials.
 
+## Deploy the registration API
+
+The Vercel frontend forwards `/api/*` requests to the Render service at `smart-lab2-1.onrender.com`. To deploy or restore that backend, create a Render Blueprint from this repository's `render.yaml` using the `main` branch. Set `MONGO_URI`, `INITIAL_ADMIN_USERNAME`, and a unique `INITIAL_ADMIN_PASSWORD` (at least 12 characters) in the Blueprint's service environment, then deploy. Render generates `JWT_SECRET` and `MACHINE_GATEWAY_TOKEN`; keep both private. The first successful MongoDB connection creates the initial administrator. The `/api/health` check must pass before registration and login will work. Free Render services may sleep when idle and take time to wake.
+
+Render cannot access the laboratory PC's USB or serial ports. For direct USB/RS-232 connections, run the backend on the workstation attached to the analyzer; use the separate local TCP gateway for supported LAN connections.
+
 ## Analyzer setup
 
 1. An administrator creates an analyzer and selects Ethernet, Wi-Fi, RS-232 or USB-serial.

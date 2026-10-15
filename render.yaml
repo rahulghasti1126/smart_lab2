@@ -1,0 +1,26 @@
+services:
+  - type: web
+    name: smart-lab2-1
+    runtime: node
+    plan: free
+    rootDir: "smart lab/backend"
+    buildCommand: npm ci
+    startCommand: npm start
+    healthCheckPath: /api/health
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: MONGO_URI
+        sync: false
+      - key: JWT_SECRET
+        generateValue: true
+      - key: CORS_ORIGINS
+        value: https://smartlab2-frontend.vercel.app
+      - key: INITIAL_ADMIN_USERNAME
+        sync: false
+      - key: INITIAL_ADMIN_NAME
+        value: Laboratory Administrator
+      - key: INITIAL_ADMIN_PASSWORD
+        sync: false
+      - key: MACHINE_GATEWAY_TOKEN
+        generateValue: true
