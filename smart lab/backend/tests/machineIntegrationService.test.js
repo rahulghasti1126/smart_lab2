@@ -58,3 +58,23 @@ test('rejects malformed protocol data instead of storing a fake result', async (
   }), /missing an MSH/);
   assert.equal(resultCreated, false);
 });
+
+test('keeps capture-only messages out of parsed analyzer results', async () => {
+  let resultCreated = false;
+  const service = createMachineIntegrationService({
+    AnalyzerMessage: {
+      findOne: async () => null,
+      create: async (record) => ({ _id: 'message-1', ...record }),
+      findByIdAndUpdate: async () => {},
+    },
+    AnalyzerResult: { create: async () => { resultCreated = true; } },
+    AuditLog: { create: async () => {} },
+  });
+  const received = await service.receiveRawMessage({
+    analyzer: { _id: 'analyzer-1', name: 'Cippoint', protocol: 'HL7' },
+    rawMessage: 'raw test message',
+    captureOnly: true,
+  });
+  assert.equal(received.captureOnly, true);
+  assert.equal(resultCreated, false);
+});

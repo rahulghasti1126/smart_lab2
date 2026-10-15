@@ -10,6 +10,7 @@ const Navbar = () => {
   const handleLogout = () => {
     socket.disconnect();
     localStorage.removeItem("user");
+    localStorage.removeItem("token");
     navigate("/");
   };
 

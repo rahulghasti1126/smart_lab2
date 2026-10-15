@@ -210,11 +210,10 @@ export default function MachineIntegration() {
             </label>
             <label className="flex items-center gap-2 text-sm font-semibold text-gray-700"><input name="autoConnect" type="checkbox" checked={form.autoConnect} onChange={updateField} /> Auto connect</label>
             <label className="flex items-center gap-2 text-sm font-semibold text-gray-700"><input name="autoReceive" type="checkbox" checked={form.autoReceive} onChange={updateField} /> Auto receive</label>
-            
             <label className="text-sm font-semibold text-gray-700">Timeout (ms)<input name="timeout" value={form.timeout || "30000"} onChange={updateField} type="number" className="mt-1 w-full p-3 border rounded-lg" /></label>
             <label className="text-sm font-semibold text-gray-700">Reconnect Interval (ms)<input name="reconnectInterval" value={form.reconnectInterval || "5000"} onChange={updateField} type="number" className="mt-1 w-full p-3 border rounded-lg" /></label>
             
-            <label className="text-sm font-semibold text-gray-700 md:col-span-2">Simulator message (optional)<textarea name="simulatorMessage" value={form.simulatorMessage} onChange={updateField} className="mt-1 w-full p-3 border rounded-lg" rows="4" placeholder="Leave blank to generate a documented test message for the selected protocol" /></label>
+            <label className="text-sm font-semibold text-gray-700 md:col-span-2">Simulator raw HL7 message<textarea name="simulatorMessage" value={form.simulatorMessage} onChange={updateField} className="mt-1 w-full p-3 border rounded-lg" rows="4" placeholder="Paste a sanitized HL7 message" /></label>
             <div className="flex gap-2">
               <button className="bg-blue-600 text-white rounded-lg px-4 py-3 font-semibold">{editingAnalyzerId ? "Update Analyzer" : "Save Analyzer"}</button>
               {editingAnalyzerId && <button type="button" onClick={() => { setEditingAnalyzerId(null); setForm(initialForm); }} className="rounded-lg border px-4 py-3 font-semibold">Cancel</button>}

@@ -1,17 +1,16 @@
 const API = "/api";
 
-const getAuthHeaders = () => {
-  const user = JSON.parse(localStorage.getItem("user") || "{}");
-  const headers = { "Content-Type": "application/json" };
-  if (user.token) {
-    headers["Authorization"] = `Bearer ${user.token}`;
-  }
-  return headers;
+const getAuthHeaders = () => ({ "Content-Type": "application/json" });
+
+const fetch = (input, init = {}) => {
+  const headers = new Headers(init.headers || {});
+  const token = localStorage.getItem("token");
+  if (token) headers.set("Authorization", `Bearer ${token}`);
+  return globalThis.fetch(input, { ...init, headers });
 };
 
 const machineHeaders = () => {
-  const user = JSON.parse(localStorage.getItem("user") || "{}");
-  return { ...getAuthHeaders(), "x-user-role": user.role || "", "x-user-id": user.id || "" };
+  return getAuthHeaders();
 };
 
 const handleResponse = async (response) => {

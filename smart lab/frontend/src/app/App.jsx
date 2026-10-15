@@ -21,7 +21,8 @@ import './App.css'
 // Private Route Component
 const PrivateRoute = ({ children }) => {
   const user = localStorage.getItem('user');
-  return user ? children : <Navigate to="/" />;
+  const token = localStorage.getItem('token');
+  return user && token ? children : <Navigate to="/" />;
 };
 
 const RouteIndexing = () => {

@@ -10,16 +10,21 @@ import { SerialPort } from 'serialport';
 import { ReadlineParser } from '@serialport/parser-readline';
 import net from 'net';
 import crypto from 'crypto';
-import jwt from 'jsonwebtoken';
-import authRoutes from './routes/authRoutes.js';
+import path from 'path';
+import { fileURLToPath } from 'url';
+import { dirname } from 'path';
+import { createAccessToken, hashPassword, isBcryptHash, isValidPassword, verifyAccessToken, verifyPassword } from './auth.js';
 import { connectDB, User, Patient, Sample, Test, Result, AnalyzerConfig, AnalyzerMessage, AnalyzerResult, Reagent, Report, Invoice, LabSettings, AuditLog } from './database.js';
 import { parseAnalyzerData } from './analyzerParser.js';
 import { getProtocolAdapter } from './machineIntegration/protocolRegistry.js';
 import { createMachineIntegrationService } from './machineIntegration/service.js';
 import { createSimulatorMessage } from './machineIntegration/simulator.js';
 import { validateAnalyzerConfig } from './machineIntegration/validation.js';
-import { AnalyzerConnectionManager } from './machineIntegration/communication/connectionManager.js';
-import { protect, allowRoles } from './middleware/auth.js';
+import { startCippointTcpServer } from './machineIntegration/cippointTcpServer.js';
+import { allowRoles } from './middleware/auth.js';
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = dirname(__filename);
 
 const app = express();
 const defaultAllowedOrigins = ['http://localhost:5173', 'https://smartlab2-frontend.vercel.app'];
@@ -34,20 +39,39 @@ app.use(cors({
   },
 }));
 app.use(express.json({ limit: '6mb' }));
+app.use('/api/auth', rateLimit({ windowMs: 15 * 60 * 1000, max: 20, standardHeaders: true, legacyHeaders: false }));
+app.use('/api', async (req, res, next) => {
+  if ((req.method === 'POST' && ['/auth/login', '/auth/register'].includes(req.path))
+    || (req.method === 'GET' && ['/health', '/'].includes(req.path))
+    || req.path.startsWith('/machine-integration/gateway/')) {
+    return next();
+  }
+
+  const secret = process.env.JWT_SECRET;
+  if (typeof secret !== 'string' || Buffer.byteLength(secret) < 32) {
+    return res.status(503).json({ error: 'API authentication is not configured securely.' });
+  }
+
+  const authorization = req.get('authorization') || '';
+  const token = authorization.startsWith('Bearer ') ? authorization.slice(7) : '';
+  const authenticatedUser = verifyAccessToken(token, secret);
+  if (!authenticatedUser) {
+    return res.status(401).json({ error: 'Authentication is required or the access token has expired.' });
+  }
+
+  try {
+    req.user = await User.findOne({ id: authenticatedUser.id }).select('id username name role');
+    if (!req.user) return res.status(401).json({ error: 'User account no longer exists.' });
+    req.authenticatedUser = authenticatedUser;
+    return next();
+  } catch (error) {
+    return next(error);
+  }
+});
 
 app.get('/api/health', (req, res) => {
   res.json({ status: 'ok', database: 'connected' });
 });
-
-app.get('/api', (req, res) => {
-  res.json({ status: 'ok', message: 'Smart Lab API is available' });
-});
-
-app.use('/api/auth', rateLimit({ windowMs: 15 * 60 * 1000, max: 20, standardHeaders: true, legacyHeaders: false }));
-app.use('/api/auth', authRoutes);
-// Hardware gateways authenticate with their separately scoped token. All
-// browser/API routes after login require a signed JWT.
-app.use('/api', (req, res, next) => req.path.startsWith('/machine-integration/gateway/') ? next() : protect(req, res, next));
 
 const httpServer = createServer(app);
 const io = new Server(httpServer, {
@@ -58,7 +82,8 @@ io.use(async (socket, next) => {
   try {
     const token = socket.handshake.auth?.token;
     if (!token || !process.env.JWT_SECRET) return next(new Error('Authentication is required.'));
-    const decoded = jwt.verify(token, process.env.JWT_SECRET);
+    const decoded = verifyAccessToken(token, process.env.JWT_SECRET);
+    if (!decoded) return next(new Error('Session is invalid or expired.'));
     const user = await User.findOne({ id: decoded.id }).select('id role');
     if (!user) return next(new Error('User account not found.'));
     socket.user = user;
@@ -79,15 +104,38 @@ const emitUpdate = (event, payload) => {
   io.emit(event, payload);
 };
 
-const machineIntegration = createMachineIntegrationService({ AnalyzerMessage, AnalyzerResult, Sample, Result, Test, AuditLog, emit: emitUpdate });
-const gatewayStatuses = new Set(['CONNECTED', 'DATA RECEIVED', 'WAITING_FOR_ANALYZER', 'WAITING FOR ANALYZER', 'DISCONNECTED', 'RECONNECTING', 'ERROR']);
-const connectionManager = new AnalyzerConnectionManager({ AnalyzerConfig, AuditLog, machineIntegration, emit: emitUpdate });
+const machineIntegration = createMachineIntegrationService({
+  AnalyzerMessage, AnalyzerResult, Sample, Result, Test, AuditLog, emit: emitUpdate,
+});
+const gatewayStatuses = new Set([
+  'CONNECTED', 'DATA RECEIVED', 'WAITING_FOR_ANALYZER', 'WAITING FOR ANALYZER',
+  'DISCONNECTED', 'RECONNECTING', 'ERROR',
+]);
+
+const handleCippointStatus = async (status, details) => {
+  const analyzer = await AnalyzerConfig.findOne({ name: 'Cippoint' });
+  if (analyzer) await AnalyzerConfig.findByIdAndUpdate(analyzer._id, { connection_status: status, updated_at: new Date().toISOString() });
+  if (status === 'ERROR') console.error(`Cippoint listener error: ${details?.error || 'Unknown TCP server error'}`);
+  emitUpdate('machine-integration-status', { analyzerId: analyzer?._id, status, details, error: details?.error || null });
+};
+
+const handleCippointData = async (rawData, details) => {
+  const analyzer = await AnalyzerConfig.findOne({ name: 'Cippoint' });
+  if (!analyzer) return console.error('Cippoint raw message was received, but no Cippoint analyzer configuration exists.');
+  try {
+    await machineIntegration.receiveRawMessage({ analyzer, rawMessage: rawData, sourceIp: details.remoteIp, connectionAt: details.connectionAt, captureOnly: true });
+  } catch (error) {
+    console.error(`Cippoint raw message storage error: ${error.message}`);
+    await handleCippointStatus('ERROR', { ...details, error: error.message });
+  }
+};
+
+const requireMachineAdmin = allowRoles('admin');
 
 const requireMachineGatewayToken = (req, res, next) => {
   const configuredToken = process.env.MACHINE_GATEWAY_TOKEN;
   const authorization = req.get('authorization') || '';
   const suppliedToken = authorization.startsWith('Bearer ') ? authorization.slice(7) : '';
-
   if (!configuredToken || configuredToken.length < 32) {
     return res.status(503).json({ error: 'Machine gateway is not configured on this server.' });
   }
@@ -97,11 +145,8 @@ const requireMachineGatewayToken = (req, res, next) => {
   if (supplied.length !== configured.length || !crypto.timingSafeEqual(supplied, configured)) {
     return res.status(401).json({ error: 'Invalid machine gateway credentials.' });
   }
-
-  next();
+  return next();
 };
-
-const requireMachineAdmin = allowRoles('admin');
 
 const getAnalyzerOr404 = async (req, res) => {
   const analyzer = await AnalyzerConfig.findById(req.params.id);
@@ -191,13 +236,10 @@ app.patch('/api/machine-integration/analyzers/:id', requireMachineAdmin, async (
     if (!validation.valid) return res.status(400).json({ error: validation.errors.join(' ') });
     Object.assign(analyzer, {
       name: input.name,
-      analyzer_id: input.analyzerId ?? input.analyzer_id ?? analyzer.analyzer_id,
-      model: input.model ?? analyzer.model,
-      manufacturer: input.manufacturer ?? analyzer.manufacturer,
-      category: input.category ?? analyzer.category,
-      ip_address: input.ipAddress || '',
-      server_ip: input.serverIp || '',
-      port: Number(input.port) || undefined,
+      model: input.model || analyzer.model,
+      ip_address: input.ipAddress,
+      server_ip: input.serverIp,
+      port: Number(input.port),
       connection_type: input.connectionType || analyzer.connection_type,
       serial_port: input.serialPort ?? analyzer.serial_port,
       baud_rate: input.baudRate ? Number(input.baudRate) : analyzer.baud_rate,
@@ -228,12 +270,29 @@ app.post('/api/machine-integration/analyzers/:id/test-connection', requireMachin
   try {
     const analyzer = await getAnalyzerOr404(req, res);
     if (!analyzer) return;
-    const test = await connectionManager.testConnection(analyzer);
-    await logAudit('analyzer_connection_tested', String(analyzer._id), req.user.id, `${analyzer.name}: ${test.status || 'TCP reachable'}`);
-    res.json({ connected: Boolean(test.reachable), status: test.status || (test.reachable ? 'TCP_REACHABLE' : 'NOT_CONNECTED'), ...test });
+
+    let isConnected = false;
+    let status = 'STOPPED';
+
+    if (analyzer.tcp_mode === 'SERVER') {
+      const server = dynamicServers[analyzer._id];
+      isConnected = Boolean(server && server.listening);
+      status = isConnected ? 'WAITING FOR ANALYZER' : 'STOPPED';
+    } else {
+      const client = dynamicClients[analyzer._id];
+      isConnected = Boolean(client && !client.destroyed);
+      status = isConnected ? 'CONNECTED' : 'STOPPED';
+    }
+
+    res.json({
+      connected: isConnected,
+      status,
+      message: isConnected ? 'Connection is active.' : 'Connection is inactive.',
+      host: analyzer.tcp_mode === 'SERVER' ? analyzer.server_ip : analyzer.ip_address,
+      port: analyzer.port,
+    });
   } catch (err) {
-    await AnalyzerConfig.findByIdAndUpdate(req.params.id, { connection_status: 'ERROR', updated_at: new Date().toISOString() });
-    res.status(502).json({ error: `Connection test failed: ${err.message}` });
+    res.status(500).json({ error: err.message });
   }
 });
 
@@ -442,140 +501,6 @@ app.get('/api/machine-integration/messages', async (req, res) => {
 app.get('/api/machine-integration/results', async (req, res) => {
   try {
     res.json(await AnalyzerResult.find().sort({ received_at: -1 }).limit(200).lean());
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-app.get('/api/machine-integration/unmatched-results', allowRoles('admin', 'technician', 'pathologist'), async (req, res) => {
-  try {
-    const results = await AnalyzerResult.find({ $or: [{ processing_status: 'UNMATCHED' }, { match_status: 'UNMATCHED' }] })
-      .sort({ received_at: -1 }).limit(200).lean();
-    res.json(results);
-  } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
-});
-
-app.post('/api/machine-integration/unmatched-results/:id/resolve', allowRoles('admin', 'technician'), async (req, res) => {
-  try {
-    const sampleId = String(req.body?.sampleId || '').trim();
-    const reason = String(req.body?.reason || '').trim();
-    if (!sampleId || !reason) return res.status(400).json({ error: 'Sample ID and resolution reason are required.' });
-    const [analyzerResult, sample] = await Promise.all([
-      AnalyzerResult.findById(req.params.id),
-      Sample.findOne({ sample_id: sampleId }),
-    ]);
-    if (!analyzerResult) return res.status(404).json({ error: 'Analyzer result not found.' });
-    if (!sample) return res.status(404).json({ error: 'The selected Sample ID does not exist.' });
-    if (analyzerResult.processing_status !== 'UNMATCHED') return res.status(409).json({ error: 'This result has already been resolved or requires a different workflow.' });
-
-    const normalized = analyzerResult.normalized_results || [];
-    if (!normalized.length) return res.status(409).json({ error: 'This legacy result has no normalized parameters and cannot be safely resolved automatically.' });
-    for (const parameter of normalized) {
-      await Result.findOneAndUpdate(
-        { sample_id: sample.sample_id, test_code: parameter.testCode },
-        { $set: {
-          patient_id: sample.patient_id, sample_id: sample.sample_id, test_code: parameter.testCode,
-          test_name: parameter.testName, result_value: parameter.resultValue, unit: parameter.unit,
-          reference_range: parameter.referenceRange, machine_name: analyzerResult.analyzer_name,
-          status: 'VALIDATION_PENDING', date: new Date().toISOString(), raw_data: JSON.stringify(parameter), analyzer_result_id: analyzerResult._id,
-        } },
-        { upsert: true, new: true, setDefaultsOnInsert: true }
-      );
-    }
-    const oldValue = analyzerResult.toObject();
-    analyzerResult.patient_id = sample.patient_id;
-    analyzerResult.sample_id = sample.sample_id;
-    analyzerResult.processing_status = 'VALIDATION_PENDING';
-    analyzerResult.match_status = 'MANUALLY_RESOLVED';
-    analyzerResult.matched_sample_id = sample.sample_id;
-    analyzerResult.review_reason = reason;
-    await Promise.all([analyzerResult.save(), Sample.findByIdAndUpdate(sample._id, { status: 'VALIDATION_PENDING' })]);
-    await logAudit('unmatched_result_resolved', String(analyzerResult._id), req.user.id, `Manually matched to ${sample.sample_id}: ${reason}`, { req, entity: 'AnalyzerResult', oldValue, newValue: analyzerResult.toObject() });
-    res.json(analyzerResult);
-  } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
-});
-
-app.get('/api/patients/:id/machine-results', async (req, res) => {
-  try {
-    const patientId = req.params.id.trim();
-    if (!patientId) return res.status(400).json({ error: 'Patient ID is required.' });
-
-    const escapedPatientId = patientId.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-    const exactIdentifier = new RegExp(`^${escapedPatientId}$`, 'i');
-    const rawMessageMatch = new RegExp(escapedPatientId, 'i');
-    const [storedResults, messages] = await Promise.all([
-      AnalyzerResult.find({
-        $or: [
-          { patient_id: exactIdentifier },
-          { sample_id: exactIdentifier },
-          { barcode: exactIdentifier },
-          { order_id: exactIdentifier },
-        ],
-      }).sort({ received_at: -1 }).limit(200).lean(),
-      AnalyzerMessage.find({ raw_message: rawMessageMatch })
-        .populate('analyzer_id', 'protocol name')
-        .sort({ received_at: -1 })
-        .limit(200)
-        .lean(),
-    ]);
-
-    const savedResults = storedResults.map((result) => ({
-      ...result,
-      parameters: result.reviewed_parameters || result.parameters || {},
-    }));
-
-    const resultsByMessage = new Map(savedResults.map((result) => [String(result.message_id), result]));
-    const matchingResults = [...savedResults];
-
-    for (const message of messages) {
-      const analyzer = message.analyzer_id;
-      if (!analyzer?.protocol) continue;
-
-      try {
-        const parsed = getProtocolAdapter(analyzer.protocol).parse(message.raw_message);
-        const identifiers = [parsed.patientId, parsed.sampleId, parsed.barcode, parsed.orderId]
-          .filter(Boolean)
-          .map((value) => String(value).trim().toLowerCase());
-        if (!identifiers.includes(patientId.toLowerCase())) continue;
-
-        const existingResult = resultsByMessage.get(String(message._id));
-        matchingResults.push({
-          ...(existingResult || {}),
-          _id: existingResult?._id || message._id,
-          message_id: message._id,
-          analyzer_name: existingResult?.analyzer_name || message.analyzer_name || analyzer.name,
-          patient_id: existingResult?.patient_id || parsed.patientId || '',
-          sample_id: existingResult?.sample_id || parsed.sampleId || '',
-          order_id: existingResult?.order_id || parsed.orderId || '',
-          barcode: existingResult?.barcode || parsed.barcode || '',
-          parameters: existingResult?.parameters || parsed.parameters || {},
-          received_at: existingResult?.received_at || message.received_at,
-          processing_status: existingResult?.processing_status || 'UNMATCHED',
-        });
-      } catch (error) {
-        console.error(`Could not parse historical analyzer message ${message._id}: ${error.message}`);
-        if (message.raw_message.toLowerCase().includes(patientId.toLowerCase())) {
-          matchingResults.push({
-            _id: message._id,
-            message_id: message._id,
-            analyzer_name: message.analyzer_name || analyzer.name,
-            received_at: message.received_at,
-            processing_status: 'ERROR',
-            parse_error: error.message,
-            raw_message: message.raw_message,
-            parameters: {},
-          });
-        }
-      }
-    }
-
-    const uniqueResults = [...new Map(matchingResults.map((result) => [String(result.message_id || result._id), result])).values()]
-      .sort((a, b) => new Date(b.received_at || 0) - new Date(a.received_at || 0));
-    res.json(uniqueResults);
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -889,6 +814,54 @@ const handleAnalyzerData = async (data) => {
   
   // Real patient matching and Result.create will happen when parser is implemented.
 };
+
+app.post('/api/auth/login', async (req, res) => {
+  try {
+    const { username, password } = req.body;
+    const passwordHash = hashPassword(password);
+    const normalizedUsername = username?.toLowerCase?.().trim();
+    const user = await User.findOne({
+      username: new RegExp(`^${normalizedUsername}$`, 'i'),
+      password_hash: passwordHash,
+    }).select('id username name role');
+    if (!user) return res.status(401).json({ error: 'Invalid credentials' });
+    res.json(user);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/api/auth/register', async (req, res) => {
+  try {
+    const { username, password, name, role = 'technician' } = req.body;
+    const normalizedUsername = username?.toLowerCase?.().trim();
+    const normalizedName = name?.trim?.();
+
+    if (!normalizedUsername || !password || !normalizedName) {
+      return res.status(400).json({ error: 'Username, password, and name are required.' });
+    }
+
+    const existing = await User.findOne({ username: normalizedUsername });
+    if (existing) return res.status(409).json({ error: 'Username already exists' });
+
+    const passwordHash = hashPassword(password);
+    const userId = `U${Date.now()}`;
+
+    await User.create({
+      id: userId,
+      username: normalizedUsername,
+      password_hash: passwordHash,
+      name: normalizedName,
+      role,
+      created_at: new Date().toISOString(),
+    });
+
+    await logAudit('user_registered', normalizedUsername, role, `New user ${normalizedUsername} registered as ${role}`);
+    res.json({ id: userId, username: normalizedUsername, name: normalizedName, role });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
 
 app.post('/api/patients/add', async (req, res) => {
   try {
@@ -1667,11 +1640,16 @@ app.use('/api', (req, res) => {
   res.status(404).json({ error: 'API route not found', path: req.path });
 });
 
-app.use((error, req, res, next) => {
-  if (res.headersSent) return next(error);
-  console.error('Request failed:', error.message || error);
-  const status = error.status || 500;
-  res.status(status).json({ error: status >= 500 ? 'Internal server error.' : error.message });
+// Serve frontend static files
+const distPath = path.resolve(__dirname, '../frontend/dist');
+app.use(express.static(distPath));
+
+// Fallback all client-side navigation requests to index.html
+app.get('*', (req, res, next) => {
+  if (req.path.startsWith('/api') || req.path.startsWith('/socket.io')) {
+    return next();
+  }
+  res.sendFile(path.join(distPath, 'index.html'));
 });
 
 const PORT = Number.parseInt(process.env.PORT || '5000', 10);
@@ -1687,11 +1665,16 @@ httpServer.on('error', (err) => {
 
 const startServer = async () => {
   try {
-    if (!process.env.JWT_SECRET || (process.env.NODE_ENV === 'production' && process.env.JWT_SECRET.length < 32)) {
-      throw new Error('JWT_SECRET must be configured with at least 32 characters in production.');
+    const jwtSecret = process.env.JWT_SECRET;
+    if (typeof jwtSecret !== 'string' || Buffer.byteLength(jwtSecret) < 32
+      || jwtSecret === 'replace-with-a-random-secret-at-least-32-characters-long') {
+      throw new Error('JWT_SECRET must be set to a non-placeholder secret with at least 32 bytes.');
     }
+    if (!process.env.MONGO_URI?.trim()) throw new Error('MONGO_URI must be configured before the server can start.');
+    if (!Number.isInteger(PORT) || PORT < 1 || PORT > 65535) throw new Error('PORT must be a valid TCP port.');
 
     await connectDB();
+    startCippointTcpServer({ onData: handleCippointData, onStatus: handleCippointStatus });
     httpServer.listen(PORT, HOST, () => {
       console.log(`Smart Lab API listening on ${HOST}:${PORT}`);
     });

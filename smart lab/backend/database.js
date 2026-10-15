@@ -153,6 +153,14 @@ const PatientSchema = new mongoose.Schema(
       type: String,
     },
 
+    test_type: {
+      type: String,
+    },
+
+    machine: {
+      type: String,
+    },
+
     date: {
       type: String,
     },
@@ -670,7 +678,6 @@ const ReportSchema = new mongoose.Schema(
       type: [mongoose.Schema.Types.Mixed],
       default: undefined,
     },
-
     source_analyzer_result_id: {
       type: mongoose.Schema.Types.ObjectId,
       ref: 'AnalyzerResult',
@@ -848,23 +855,30 @@ const AuditLog =
 
 const seedInitialData = async () => {
   try {
-    /* -----------------------------------------------------
-       ADMIN USER
-       ----------------------------------------------------- */
-
-    const adminUser = await User.findOne({ username: process.env.ADMIN_INITIAL_USERNAME || 'admin' });
-    const initialAdminPassword = process.env.ADMIN_INITIAL_PASSWORD;
-    if (!adminUser && initialAdminPassword) {
+    const initialAdminUsername = (
+      process.env.INITIAL_ADMIN_USERNAME
+      || process.env.ADMIN_INITIAL_USERNAME
+      || (process.env.ADMIN_INITIAL_PASSWORD ? 'admin' : '')
+    ).trim().toLowerCase();
+    const initialAdminName = (
+      process.env.INITIAL_ADMIN_NAME
+      || process.env.ADMIN_INITIAL_NAME
+      || 'Laboratory Administrator'
+    ).trim();
+    const initialAdminPassword = process.env.INITIAL_ADMIN_PASSWORD || process.env.ADMIN_INITIAL_PASSWORD;
+    const hasAdmin = await User.exists({ role: 'admin' });
+    if (!hasAdmin && initialAdminUsername && initialAdminPassword && initialAdminPassword.length >= 12) {
       await User.create({
-        id: 'U1',
-        username: process.env.ADMIN_INITIAL_USERNAME || 'admin',
+        id: `U${Date.now()}`,
+        username: initialAdminUsername,
         password_hash: await hashPassword(initialAdminPassword),
         role: 'admin',
-        name: process.env.ADMIN_INITIAL_NAME || 'Laboratory Administrator',
+        name: initialAdminName,
         created_at: new Date().toISOString(),
       });
-
-      console.log('Admin user created.');
+      console.log('Initial administrator account created from environment configuration.');
+    } else if (!hasAdmin) {
+      console.warn('No administrator account exists. Configure an initial administrator username and password of at least 12 characters to bootstrap one.');
     }
 
     /* -----------------------------------------------------

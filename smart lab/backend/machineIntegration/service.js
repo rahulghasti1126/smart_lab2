@@ -52,7 +52,7 @@ const audit = async (AuditLog, data) => {
  * are identical for TCP, Wi-Fi, RS-232, USB-serial and the simulator.
  */
 export const createMachineIntegrationService = ({ AnalyzerMessage, AnalyzerResult, Sample, Result, Test, AuditLog, emit }) => ({
-  async receiveRawMessage({ analyzer, rawMessage, sourceIp, connectionAt, source = 'tcp' }) {
+  async receiveRawMessage({ analyzer, rawMessage, sourceIp, connectionAt, source = 'tcp', captureOnly = false }) {
     const validation = validateRawMessage(rawMessage);
     if (!validation.valid) throw new Error(validation.error);
 
@@ -78,6 +78,8 @@ export const createMachineIntegrationService = ({ AnalyzerMessage, AnalyzerResul
       processing_status: PROCESSING_STATUSES.RECEIVED,
     });
     emit?.('machine-raw-message-received', rawRecord);
+
+    if (captureOnly) return { rawRecord, captureOnly: true };
 
     try {
       const parsed = getProtocolAdapter(analyzer.protocol).parse(rawMessage);

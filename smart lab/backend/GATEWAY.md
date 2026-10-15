@@ -48,3 +48,7 @@ Leave this process running on the lab PC. It does not replace the hosted API.
 - Check the gateway console and Machine Integration page. The selected analyzer's status should move from `WAITING FOR ANALYZER` to `CONNECTED` when the device reaches the gateway.
 
 The Render website URL is an HTTP(S) address and is not the analyzer's TCP destination. The analyzer connects to the local gateway PC; only the gateway's HTTPS requests go to Render.
+
+## USB and serial analyzers
+
+Render cannot access a laboratory PC's USB ports, COM ports, or serial devices. For a direct USB/RS-232 connection, run the backend on the lab workstation that has the analyzer physically connected. The local gateway described above accepts TCP/LAN connections; it does not expose USB or serial devices to the hosted Render service.

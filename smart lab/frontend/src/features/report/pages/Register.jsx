@@ -48,8 +48,8 @@ const Register = () => {
           <div className="bg-blue-100 w-20 h-20 rounded-full flex items-center justify-center mx-auto mb-4 shadow">
             <span className="text-3xl">🧪</span>
           </div>
-          <h1 className="text-3xl font-bold text-gray-800">Register Pathologist</h1>
-          <p className="text-gray-600 mt-1 text-sm">Create a new laboratory user account</p>
+          <h1 className="text-3xl font-bold text-gray-800">Register Lab Account</h1>
+          <p className="text-gray-600 mt-1 text-sm">Public registration creates a technician account.</p>
         </div>
 
         {error && (
@@ -93,6 +93,8 @@ const Register = () => {
             <input
               type="password"
               placeholder="Create a password"
+              minLength={8}
+              maxLength={72}
               className="mt-2 w-full px-4 py-3 rounded-xl border border-gray-300 focus:ring-2 focus:ring-blue-500 outline-none"
               value={password}
               onChange={(e) => setPassword(e.target.value)}

@@ -1,5 +1,5 @@
-import React, { useState } from "react";
-import { useNavigate } from "react-router-dom";
+import { useState } from "react";
+import { useNavigate, Link } from "react-router-dom";
 import { loginUser } from "../services/api";
 import socket from '../../../app/socket';
 
@@ -19,6 +19,8 @@ const Login = () => {
     try {
       const user = await loginUser({ username, password });
 
+      localStorage.setItem("token", user.token);
+      delete user.token;
       localStorage.removeItem("user");
       localStorage.setItem("user", JSON.stringify(user));
       localStorage.setItem(
@@ -30,6 +32,7 @@ const Login = () => {
       // React Router navigation - prevents Vercel 404
       navigate("/home");
     } catch (err) {
+      localStorage.removeItem("token");
       setError(err.message || "Invalid username or password");
     } finally {
       setLoading(false);
@@ -60,6 +63,16 @@ const Login = () => {
             Pathology Laboratory Management System
           </p>
         </div>
+
+        <p className="text-center text-sm text-gray-600 mb-6">
+          New Pathologist?{" "}
+          <Link
+            to="/register"
+            className="text-blue-600 font-semibold hover:underline"
+          >
+            Register here
+          </Link>
+        </p>
 
         {/* Error */}
         {error && (
@@ -123,8 +136,6 @@ const Login = () => {
             {loading ? "Logging in..." : "Login"}
           </button>
         </form>
-
-        <p className="text-center text-sm text-gray-600 mt-6">New personnel accounts are provisioned by a laboratory administrator.</p>
 
         {/* Public product description */}
         <div className="mt-6 text-xs text-gray-500 bg-gray-100 p-3 rounded-lg text-center">

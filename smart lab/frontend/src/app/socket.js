@@ -3,7 +3,7 @@ import { io } from 'socket.io-client';
 // Use explicit backend URL when provided, otherwise fall back to localhost:5000
 const SOCKET_URL = import.meta.env.VITE_API_URL || 'http://localhost:5000';
 const currentToken = () => {
-  try { return JSON.parse(localStorage.getItem('user') || '{}').token; } catch { return undefined; }
+  return localStorage.getItem('token') || undefined;
 };
 
 // Create a single shared socket instance with reconnection options
