@@ -122,6 +122,20 @@ export const getReports = async () => {
   return handleResponse(res);
 };
 
+export const getUsers = async () => {
+  const res = await authenticatedFetch(`${API}/users`);
+  return handleResponse(res);
+};
+
+export const updateUserRole = async (id, role) => {
+  const res = await fetch(`${API}/users/${encodeURIComponent(id)}/role`, {
+    method: "PATCH",
+    headers: getAuthHeaders(),
+    body: JSON.stringify({ role }),
+  });
+  return handleResponse(res);
+};
+
 export const verifyReport = async (id) => {
   const res = await fetch(`${API}/reports/verify`, {
     method: 'POST',

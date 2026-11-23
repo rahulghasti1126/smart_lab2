@@ -58,6 +58,7 @@ const Navbar = () => {
               { name: "Billing", path: "/billing" },
               { name: "History", path: "/history" },
               { name: "Unmatched", path: "/unmatched-results" },
+              ...(user.role === "admin" ? [{ name: "Users", path: "/users" }] : []),
             ].map((item, i) => (
               <motion.div key={i} whileHover={{ scale: 1.1 }}>
                 <Link
@@ -76,7 +77,7 @@ const Navbar = () => {
               <div className="text-sm font-semibold text-gray-800">
                 {user.name || "Rahul"}
               </div>
-              <div className="text-xs text-gray-600">Pathologist</div>
+              <div className="text-xs text-gray-600">{user.role || "Lab user"}</div>
             </div>
 
             <motion.button

@@ -17,12 +17,18 @@ import MachineIntegration from "../features/machineIntegration/pages/MachineInte
 import MachineResults from "../features/machineIntegration/pages/MachineResults";
 import RawMessages from "../features/machineIntegration/pages/RawMessages";
 import UnmatchedResults from "../features/machineIntegration/pages/UnmatchedResults";
+import UserManagement from '../features/report/pages/UserManagement';
 import './App.css'
 // Private Route Component
 const PrivateRoute = ({ children }) => {
   const user = localStorage.getItem('user');
   const token = localStorage.getItem('token');
   return user && token ? children : <Navigate to="/" />;
+};
+
+const AdminRoute = ({ children }) => {
+  const user = JSON.parse(localStorage.getItem('user') || '{}');
+  return user.role === 'admin' ? children : <Navigate to="/home" replace />;
 };
 
 const RouteIndexing = () => {
@@ -46,6 +52,13 @@ function App() {
         <Route path="/" element={<Login />} />
         <Route path="/login" element={<Login />} />
         <Route path="/register" element={<Register />} />
+        <Route path="/users" element={
+          <PrivateRoute>
+            <AdminRoute>
+              <UserManagement />
+            </AdminRoute>
+          </PrivateRoute>
+        } />
         <Route path="/home" element={
           <PrivateRoute>
             <Home />
