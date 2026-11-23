@@ -616,7 +616,7 @@ const Patient = () => {
             <h2 className="text-2xl font-bold mb-4 text-blue-700">
               Patient Records & Machine Control
             </h2>
-            <div className="overflow-x-auto">
+            <div className={`overflow-x-auto ${patients.length > 5 ? "max-h-[24rem] overflow-y-auto" : ""}`}>
               <table className="w-full text-lg">
                 <thead>
                   <tr className="bg-blue-600 text-white text-left">
@@ -1029,7 +1029,7 @@ const Patient = () => {
             {testResults.length === 0 ? (
               <p className="text-gray-500 text-center p-6">No results yet</p>
             ) : (
-              <div className="overflow-x-auto">
+              <div className={`overflow-x-auto ${testResults.length > 5 ? "max-h-[24rem] overflow-y-auto" : ""}`}>
                 <table className="w-full text-lg">
                   <thead>
                     <tr className="bg-blue-600 text-white text-left">
