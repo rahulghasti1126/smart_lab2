@@ -818,14 +818,31 @@ const handleAnalyzerData = async (data) => {
 app.post('/api/auth/login', async (req, res) => {
   try {
     const { username, password } = req.body;
-    const passwordHash = hashPassword(password);
     const normalizedUsername = username?.toLowerCase?.().trim();
+    if (!normalizedUsername || typeof password !== 'string') {
+      return res.status(400).json({ error: 'Username and password are required.' });
+    }
+
+    const escapedUsername = normalizedUsername.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
     const user = await User.findOne({
-      username: new RegExp(`^${normalizedUsername}$`, 'i'),
-      password_hash: passwordHash,
-    }).select('id username name role');
-    if (!user) return res.status(401).json({ error: 'Invalid credentials' });
-    res.json(user);
+      username: new RegExp(`^${escapedUsername}$`, 'i'),
+    }).select('id username name role password_hash');
+    if (!user || !(await verifyPassword(password, user.password_hash))) {
+      return res.status(401).json({ error: 'Invalid credentials' });
+    }
+
+    if (!isBcryptHash(user.password_hash)) {
+      user.password_hash = await hashPassword(password);
+      await user.save();
+    }
+
+    res.json({
+      id: user.id,
+      username: user.username,
+      name: user.name,
+      role: user.role,
+      token: createAccessToken(user, process.env.JWT_SECRET),
+    });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -844,7 +861,7 @@ app.post('/api/auth/register', async (req, res) => {
     const existing = await User.findOne({ username: normalizedUsername });
     if (existing) return res.status(409).json({ error: 'Username already exists' });
 
-    const passwordHash = hashPassword(password);
+    const passwordHash = await hashPassword(password);
     const userId = `U${Date.now()}`;
 
     await User.create({
