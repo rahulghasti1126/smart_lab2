@@ -850,7 +850,8 @@ app.post('/api/auth/login', async (req, res) => {
 
 app.post('/api/auth/register', async (req, res) => {
   try {
-    const { username, password, name, role = 'technician' } = req.body;
+    const { username, password, name } = req.body;
+    const role = 'technician';
     const normalizedUsername = username?.toLowerCase?.().trim();
     const normalizedName = name?.trim?.();
 
